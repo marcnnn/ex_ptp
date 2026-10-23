@@ -5,8 +5,13 @@ defmodule ExPtp.Profile do
   default and, for the intervals, its permitted `{min, max}` range
   (log2 seconds; the receipt timeout is in announce intervals).
 
-  The numbers are transcribed from memory of the standards, not checked
-  against the text; treat the ranges as a starting point.
+  Unverified: the numbers are transcribed from memory of the standards
+  (AES67-2018 Annex A, SMPTE ST 2059-2:2021), not checked against the text;
+  treat them as a starting point. Known uncertain: the AES67 announce
+  default (0 here, the standard may say 1) and its Delay_Req range, the
+  SMPTE ST 2059-2 Delay_Req range and announce receipt timeout range.
+  Peer delay is allowed by both media profiles; the defaults use `:e2e`.
+  Not modelled: the SMPTE synchronization metadata TLV.
 
       iex> ExPtp.Profile.get(:aes67).domain
       0

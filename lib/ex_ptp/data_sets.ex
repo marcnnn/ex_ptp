@@ -82,7 +82,7 @@ defmodule ExPtp.DataSets do
   end
 
   defmodule TimeProperties do
-    @moduledoc "timePropertiesDS. `time_source` 0xA is INTERNAL_OSCILLATOR."
+    @moduledoc "timePropertiesDS. `time_source` 0xA0 is INTERNAL_OSCILLATOR."
     defstruct current_utc_offset: 37,
               current_utc_offset_valid: false,
               leap59: false,
@@ -90,7 +90,7 @@ defmodule ExPtp.DataSets do
               time_traceable: false,
               frequency_traceable: false,
               ptp_timescale: true,
-              time_source: 0xA
+              time_source: 0xA0
 
     @doc "From an Announce message (flags and body)."
     def from_announce(%ExPtp.Message{body: b} = m) do

@@ -129,7 +129,7 @@ streams, `tuser` layouts, timing) and is met by `MacRx` / `MacTx` and verified w
 From running `ExPtp.Port` against linuxptp 4.2 `ptp4l` and Wireshark 4.4 in containers
 (`mix test --only interop`, README "Interop").
 
-### 1. Bug: default `time_source` is 0xA, IEEE 1588 INTERNAL_OSCILLATOR is 0xA0
+### 1. Fixed: default `time_source` was 0xA, IEEE 1588 INTERNAL_OSCILLATOR is 0xA0
 
 `lib/ex_ptp/data_sets.ex` (`TimePropertiesDS` default and its moduledoc) uses `0xA`. The
 TimeSource enumeration (IEEE 1588-2019 table 6) is ATOMIC_CLOCK 0x10, GPS 0x20,
@@ -207,7 +207,17 @@ timescale it returns, and `current_utc_offset_valid` should probably follow the 
 
 ### 6. Not covered
 
-Peer delay (P2P) and transparent clocks, L2 transport against ptp4l (`-2`, not tried), one-step Sync, hardware timestamping, the AES67
+Peer delay (P2P) against ptp4l (`ExPtp.Port` has P2P since wave 3, tested in `ExPtp.Sim` only), transparent clocks, L2 transport against ptp4l (`-2`, not tried), one-step Sync, hardware timestamping, the AES67
 profile's announce timeout and domain constraints on a switch, other implementations (a PTP
 grandmaster, Dante, AVB `gptp`).
 
+
+## Wave 3 leftovers (ex_ptp internal)
+
+- `test/ex_ptp/sim_test.exs` "SMPTE ST 2059-2 profile ..." passes in the full run but fails when run
+  alone (`mix test test/ex_ptp/sim_test.exs:<line>`): neither port sends anything in 15 s. Looks like a
+  start-up race between `Port`'s `handle_continue` and the first `Sim.run_for`; not investigated.
+- The delay paths are closed loop in `ExPtp.Sim` (BEAM, drift, jitter); not yet through the Cosim session
+  API (`ExHdl.RTL.Cosim` open/poke/peek/step) against the RTL servo/timestamp unit.
+- Profile numbers still unverified against AES67 / ST 2059-2 text (see `ExPtp.Profile` moduledoc).
+- Interop items 2-4 (software timestamp gains, UDP transport in lib, timescale) still open.
