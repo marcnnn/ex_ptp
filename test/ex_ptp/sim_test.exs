@@ -1,7 +1,7 @@
 defmodule ExPtp.SimTest do
   use ExUnit.Case, async: true
 
-  alias ExPtp.{Port, Sim, Timestamp}
+  alias ExPtp.{Correction, Port, Sim, Timestamp}
 
   @s 1_000_000_000
 
@@ -101,6 +101,60 @@ defmodule ExPtp.SimTest do
     IO.puts("settled below 1 us after #{settled} sync intervals (#{settled / 8} s from start)")
     assert settled < 240
     assert trace |> Enum.drop(settled) |> max_abs() < 1_000
+  end
+
+  test "peer delay mechanism: slave locks on the Pdelay measurement, no Delay_Req" do
+    {sim, m, s} = pair(port: [port_ds: [delay_mechanism: :p2p, log_min_pdelay_req_interval: -1]])
+    _ = offsets(sim, :s, :m, 25)
+    assert Port.state(m) == :master
+    assert Port.state(s) == :slave
+    window = offsets(sim, :s, :m, 30)
+    IO.puts("2 clocks, peer delay, 25..55 s: max |offset| #{max_abs(window)} ns")
+    assert max_abs(window) < 300
+    info = Port.info(s)
+    assert info.locked
+    assert_in_delta info.mean_path_delay_ns, 5_100, 150
+    assert_in_delta Correction.to_ns(info.port_ds.peer_mean_path_delay), 5_100, 400
+    refute Map.has_key?(info.stats.tx, :delay_req)
+    assert info.stats.tx.pdelay_req > 50
+    # the master measures its peer delay too
+    assert Port.info(m).stats.rx.pdelay_resp_follow_up > 50
+    assert_in_delta Port.info(m).mean_path_delay_ns, 5_100, 400
+  end
+
+  test "peer delay and end to end delay agree on a direct link with drift" do
+    results =
+      for mech <- [:e2e, :p2p] do
+        {sim, _m, s} =
+          pair(mdrift: 30, sdrift: -40, port: [port_ds: [delay_mechanism: mech]])
+
+        _ = offsets(sim, :s, :m, 40)
+        Port.info(s).mean_path_delay_ns
+      end
+
+    [e2e, p2p] = results
+    assert_in_delta e2e, p2p, 200
+  end
+
+  test "servo lock time: SLAVE within a bounded time after the slave starts syncing" do
+    for {mdrift, sdrift} <- [{-20, 50}, {50, -50}, {0, 0}] do
+      {sim, _m, s} = pair(mdrift: mdrift, sdrift: sdrift)
+      # 125 ms steps (one AES67 sync interval) over 60 s
+      trace =
+        for _ <- 1..480 do
+          Sim.run_for(sim, 125_000_000)
+          Port.state(s)
+        end
+
+      first_unc = Enum.find_index(trace, &(&1 == :uncalibrated))
+      first_slave = Enum.find_index(trace, &(&1 == :slave))
+      assert first_unc && first_slave
+      lock_s = (first_slave - first_unc) / 8
+      IO.puts("drift #{mdrift}/#{sdrift} ppm: locked #{lock_s} s after UNCALIBRATED")
+      assert lock_s < 20
+      # once locked it stays locked
+      assert trace |> Enum.drop(first_slave) |> Enum.all?(&(&1 == :slave))
+    end
   end
 
   test "asymmetric path: offset error is half the delay asymmetry" do

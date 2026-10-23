@@ -9,7 +9,14 @@ defmodule ExPtp.Port do
   every announce interval, and acts as
   master (Announce, Sync/Follow_Up, Delay_Resp) or slave (offset and mean
   path delay from `ExPtp.Delay`, PI servo from `ExPtp.Servo` steering the
-  transport's clock, lock detection). Peer delay messages are ignored.
+  transport's clock, lock detection).
+
+  With `delay_mechanism: :p2p` in the port data set (`port_ds: [delay_mechanism: :p2p]`)
+  the port runs the peer delay mechanism instead (clause 11.4, two-step responder): it
+  sends Pdelay_Req every `log_min_pdelay_req_interval` in every active state, answers
+  Pdelay_Req with Pdelay_Resp (`t2`) and Pdelay_Resp_Follow_Up (`t3`), and a slave uses
+  the measured peer delay as its mean path delay and sends no Delay_Req. There is no
+  transparent clock, so peer and end to end delay are the same on a direct link.
 
   The slave goes UNCALIBRATED -> SLAVE when the servo reports lock, and back
   to UNCALIBRATED when it loses it.
@@ -74,6 +81,7 @@ defmodule ExPtp.Port do
     :last_sync,
     :pending_sync,
     :pending_dreq,
+    :pending_pdelay,
     :mpd,
     :offset,
     :freq_ppb,
@@ -208,7 +216,19 @@ defmodule ExPtp.Port do
   defp transition(s, old, new) do
     s = %{s | port_ds: %{s.port_ds | port_state: new}, timers: %{}}
     notify(s, {:state, new, old})
-    enter(s, old, new)
+    s |> enter(old, new) |> arm_pdelay()
+  end
+
+  defp p2p?(s), do: s.port_ds.delay_mechanism == :p2p
+
+  defp arm_pdelay(%{port_ds: %{port_state: st}} = s)
+       when st in [:initializing, :faulty, :disabled],
+       do: s
+
+  defp arm_pdelay(s) do
+    if p2p?(s) and not Map.has_key?(s.timers, :pdelay_tx),
+      do: arm(s, :pdelay_tx, 1_000_000),
+      else: s
   end
 
   defp enter(s, _old, :initializing), do: fire(reset_foreign(s), :initialized)
@@ -261,6 +281,7 @@ defmodule ExPtp.Port do
 
   defp announce_ns(s), do: Profile.interval_ns(s.port_ds.log_announce_interval)
   defp sync_ns(s), do: Profile.interval_ns(s.port_ds.log_sync_interval)
+  defp pdelay_ns(s), do: Profile.interval_ns(s.port_ds.log_min_pdelay_req_interval)
   defp dreq_ns(s), do: Profile.interval_ns(s.port_ds.log_min_delay_req_interval)
 
   defp arm_announce_timeout(s),
@@ -276,6 +297,7 @@ defmodule ExPtp.Port do
   defp timer(s, :announce_tx), do: s |> send_announce() |> arm(:announce_tx, announce_ns(s))
   defp timer(s, :sync_tx), do: s |> send_sync() |> arm(:sync_tx, sync_ns(s))
   defp timer(s, :delay_req_tx), do: s |> send_delay_req() |> arm(:delay_req_tx, dreq_ns(s))
+  defp timer(s, :pdelay_tx), do: s |> send_pdelay_req() |> arm(:pdelay_tx, pdelay_ns(s))
   defp timer(s, :qualification), do: fire(s, :qualification_timeout)
 
   defp timer(s, :announce_timeout) do
@@ -393,6 +415,12 @@ defmodule ExPtp.Port do
     run_bmca(s)
   end
 
+  defp receive_msg(s, %Message{type: :pdelay_req} = m, rx), do: send_pdelay_resp(s, m, rx)
+  defp receive_msg(s, %Message{type: :pdelay_resp} = m, rx), do: on_pdelay_resp(s, m, rx)
+
+  defp receive_msg(s, %Message{type: :pdelay_resp_follow_up} = m, _),
+    do: on_pdelay_follow_up(s, m)
+
   defp receive_msg(%{port_ds: %{port_state: :master}} = s, %Message{type: :delay_req} = m, rx),
     do: send_delay_resp(s, m, rx)
 
@@ -439,6 +467,7 @@ defmodule ExPtp.Port do
     s = %{s | last_sync: {t1, t2, c}}
 
     cond do
+      s.mpd == nil and p2p?(s) -> s
       s.mpd == nil and s.pending_dreq == nil -> send_delay_req(s)
       s.mpd == nil -> s
       true -> servo(s, t1, t2, c)
@@ -523,6 +552,38 @@ defmodule ExPtp.Port do
           if m.log_interval != @undefined_interval,
             do: follow_dreq_interval(s, m.log_interval),
             else: s
+
+        if sample < 0,
+          do: s,
+          else: %{
+            s
+            | mpd: filter_mpd(s, sample),
+              port_ds: %{s.port_ds | peer_mean_path_delay: sample}
+          }
+
+      _ ->
+        s
+    end
+  end
+
+  defp on_pdelay_resp(s, %{body: b, sequence_id: seq} = m, t4) do
+    case s.pending_pdelay do
+      {^seq, t1} when b.requesting_port == s.port_ds.port_identity ->
+        %{s | pending_pdelay: {seq, t1, b.request_receipt_timestamp, t4, m.correction, m.source}}
+
+      _ ->
+        s
+    end
+  end
+
+  defp on_pdelay_follow_up(s, %{body: b, sequence_id: seq} = m) do
+    case s.pending_pdelay do
+      {^seq, t1, t2, t4, c, src}
+      when src == m.source and b.requesting_port == s.port_ds.port_identity ->
+        sample =
+          Delay.p2p_mean_path_delay(t1, t2, b.response_origin_timestamp, t4, c, m.correction)
+
+        s = %{s | pending_pdelay: nil}
 
         if sample < 0,
           do: s,
@@ -630,7 +691,7 @@ defmodule ExPtp.Port do
   end
 
   defp send_delay_req(s) do
-    if s.last_sync == nil do
+    if s.last_sync == nil or p2p?(s) do
       s
     else
       {seq, s} = next_seq(s, :delay_req)
@@ -648,6 +709,46 @@ defmodule ExPtp.Port do
       )
 
     {_, s} = transmit(s, m)
+    s
+  end
+
+  defp send_pdelay_req(s) do
+    {seq, s} = next_seq(s, :pdelay_req)
+
+    m =
+      base(s, :pdelay_req, seq, %{origin_timestamp: %Timestamp{}},
+        log_interval: s.port_ds.log_min_pdelay_req_interval
+      )
+
+    {t1, s} = transmit(s, m)
+    %{s | pending_pdelay: {seq, t1}}
+  end
+
+  # Two-step responder: t2 in the Pdelay_Resp, t3 in the follow up.
+  defp send_pdelay_resp(s, req, t2) do
+    resp =
+      base(
+        s,
+        :pdelay_resp,
+        req.sequence_id,
+        %{request_receipt_timestamp: t2, requesting_port: req.source},
+        flags: Message.flags([:two_step]),
+        log_interval: @undefined_interval
+      )
+
+    {t3, s} = transmit(s, resp)
+
+    fu =
+      base(
+        s,
+        :pdelay_resp_follow_up,
+        req.sequence_id,
+        %{response_origin_timestamp: t3, requesting_port: req.source},
+        correction: req.correction,
+        log_interval: @undefined_interval
+      )
+
+    {_, s} = transmit(s, fu)
     s
   end
 
