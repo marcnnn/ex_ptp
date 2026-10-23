@@ -1,0 +1,6 @@
+# tcpdump in the network namespace of a container under test (PTP capture).
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      iproute2 ethtool tcpdump socat iputils-ping iputils-arping procps \
+ && rm -rf /var/lib/apt/lists/*

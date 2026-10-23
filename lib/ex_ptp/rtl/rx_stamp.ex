@@ -12,12 +12,18 @@ defmodule ExPtp.RTL.RxStamp do
   ## Contract with the MAC
 
   Every `rx_sof` of the timestamp unit is followed by exactly one frame on
-  `s_axis`, in order (bad frames included, flagged with `s_axis_tuser = 1`
-  on their last beat; they are not dropped between the SOF and this
-  module). Timestamps are queued (4 entries); the first beat of a frame
+  `s_axis`, in order (bad frames included, flagged with bit 0 of the 4 bit
+  `s_axis_tuser` on their last beat, `ExNet.RTL.Ifc.mac_rx/2`; they are not
+  dropped between the SOF and this module). The stream is the MAC receive
+  stream, or its classifier output (`ExNet.RTL.Classifier`, which keeps the
+  frames and adds 14 cycles; connect its `tdata`, `tkeep`, `tlast`, `tuser`,
+  `tvalid`). Timestamps are queued (4 entries); the first beat of a frame
   waits until its timestamp is there. The timestamp unit has a latency of
   about 3 `:sys` cycles after the SOF and the stream normally arrives
-  later, so the wait is zero. After `wait` cycles (default 127) the frame
+  later (the MAC's first beat 2 cycles after `rx_sof`, the classifier 14
+  more), so the wait is zero. `s_axis_tready` is then high whenever the sink is
+  ready: behind a source that cannot stall (MAC, classifier) keep `m_axis_tready`
+  high or put a FIFO behind this module. After `wait` cycles (default 127) the frame
   goes out with `ts_valid = 0` (`no_ts` pulses) and the timestamp that
   arrives late is discarded, so the queue never loses its alignment.
   `ts_overflow` pulses when a timestamp found the queue full.
@@ -29,11 +35,12 @@ defmodule ExPtp.RTL.RxStamp do
   """
   use ExHdl.RTL
 
+  alias ExNet.RTL.Ifc, as: NetIfc
   alias ExPtp.RTL.{PtpDetect, TsFifo}
 
   def build(bits \\ 64, opts \\ []) do
     wait = Keyword.get(opts, :wait, 127)
-    s_if = Interface.axi_stream(data: bits, user: 1)
+    s_if = NetIfc.mac_rx(bits, ready: true, keep: true)
     m_if = Interface.axi_stream(data: bits, user: 102)
 
     module "ptp_rx_stamp_w#{bits}_t#{wait}" do
@@ -85,7 +92,7 @@ defmodule ExPtp.RTL.RxStamp do
           o_data <~ s.tdata
           o_keep <~ s.tkeep
           o_last <~ s.tlast
-          o_bad <~ s.tuser
+          o_bad <~ NetIfc.bad(s.tuser)
           at_start <~ s.tlast
 
           if at_start do

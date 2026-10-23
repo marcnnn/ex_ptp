@@ -15,10 +15,17 @@ defmodule ExPtp.RTL.TxInsert do
   The time is sampled when the first beat of a frame is accepted, plus
   `comp` (u32, 2^-16 ns): the fixed delay from this module's input to the
   first bit on the wire (preamble, MAC and PHY pipeline), calibrated once.
+  The stream is `ExNet.RTL.Ifc.mac_tx/2`: `tuser` (the PTP tag) is passed on
+  with every beat. From the first beat accepted here in cycle `a` to the Start
+  word on the MAC's pins are `ExNet.RTL.Ifc.tx_first_beat_cycles/0` (2) cycles
+  with `ExNet.RTL.MacTx` directly behind (`comp` covers them plus the PHY).
   It is computed in the cycles before the origin field arrives (at least
   6 beats later on a 64 bit bus, 48 on an 8 bit bus) and truncated to
-  nanoseconds: `stamp/2` is the model. The MAC TX must not stall after it
-  accepted the first beat, or the sampled time becomes wrong.
+  nanoseconds: `stamp/2` is the model. The MAC TX does not stall after it
+  accepted the first beat (a bubble before the second beat is the MAC's
+  idle cycle: `ready` passes through, nothing is lost); the source must not
+  pause inside a frame (`ExNet.RTL.Ifc` says why: store and forward before
+  this module).
 
   ## What is modified
 
@@ -48,6 +55,7 @@ defmodule ExPtp.RTL.TxInsert do
   use ExHdl.RTL
   import Bitwise
 
+  alias ExNet.RTL.Ifc, as: NetIfc
   alias ExPtp.RTL.PtpDetect
 
   @wrap 1_000_000_000 <<< 16
@@ -91,7 +99,7 @@ defmodule ExPtp.RTL.TxInsert do
   def build(bits \\ 64) do
     wb = div(bits, 8)
     lg = ExHdl.RTL.Builder.ceil_log2(wb)
-    axis = Interface.axi_stream(data: bits)
+    axis = NetIfc.mac_tx(bits, keep: true)
 
     module "ptp_tx_insert_w#{bits}" do
       s = slave(:s_axis, axis)
@@ -110,6 +118,7 @@ defmodule ExPtp.RTL.TxInsert do
       o_data = reg(:o_data, bits, reset: nil)
       o_keep = reg(:o_keep, wb, reset: nil)
       o_last = reg(:o_last, 1, reset: nil)
+      o_user = reg(:o_user, 8, reset: nil)
       at_start = reg(:at_start, 1, reset: 1)
       did = reg(:did, 1)
       c_sec = reg(:c_sec, 48, reset: nil)
@@ -160,6 +169,7 @@ defmodule ExPtp.RTL.TxInsert do
       m.tdata <~ cat(lanes |> Enum.map(& &1.byte) |> Enum.reverse())
       m.tkeep <~ o_keep
       m.tlast <~ o_last
+      m.tuser <~ o_user
       hit = wire(:hit, Enum.reduce(lanes, false, fn l, acc -> acc or l.ts end))
 
       sync do
@@ -173,6 +183,7 @@ defmodule ExPtp.RTL.TxInsert do
           o_data <~ s.tdata
           o_keep <~ s.tkeep
           o_last <~ s.tlast
+          o_user <~ s.tuser
           at_start <~ s.tlast
 
           if at_start do

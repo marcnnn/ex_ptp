@@ -7,8 +7,8 @@ defmodule ExPtp.RTL.MediaNco do
   ## Free running part (`ExPtp.MediaClock.Nco`, bit-exact)
 
   Every cycle `{carry, phase} = phase + inc` (64 bit). `tick` is high for
-  one cycle after a carry, with `rtp` already incremented in that cycle
-  (`rtp` = number of ticks since the last alignment plus its base).
+  one cycle after a carry, with `rtp_ts` already incremented in that cycle
+  (`rtp_ts` = number of ticks since the last alignment plus its base).
   `inc = rate / f_clk * 2^64`: `Nco.increment/3` (written with `inc_wr`,
   `inc_in`), or in `follow` mode derived from the wallclock's increment so
   the media clock moves with every rate correction the servo makes:
@@ -27,11 +27,11 @@ defmodule ExPtp.RTL.MediaNco do
   loop), the sample count `floor(t * rate)` and the phase
   `frac(t * rate) * 2^64` for `t = seconds + (ns + frac / 2^32)` ns, then
   loads the accumulator with the value advanced by the cycles the
-  computation took, so that from the cycle `aligned` pulses, `rtp` and
+  computation took, so that from the cycle `aligned` pulses, `rtp_ts` and
   `phase` match the wallclock reading of the same cycle (`ideal/4`).
   `rate` (u18) and `offset` (u32) must be stable from `align` until
   `aligned`. The model rounds `t` down to whole ns, the hardware keeps the
-  32-bit fraction: the two `rtp` can differ by one where `t * rate` is within
+  32-bit fraction: the two `rtp_ts` can differ by one where `t * rate` is within
   `rate * 2^-32` of an integer.
 
   Align once after start, after a wallclock `step_wr`/`set_wr`, and now and
@@ -41,6 +41,7 @@ defmodule ExPtp.RTL.MediaNco do
   """
   use ExHdl.RTL
   import Bitwise
+  alias ExPtp.RTL.Ifc
 
   @ns 1_000_000_000
   @m @ns <<< 32
@@ -53,7 +54,7 @@ defmodule ExPtp.RTL.MediaNco do
 
   @doc """
   The ideal 96 bit fixed point media time `{rtp::32, phase::64}` for a wallclock
-  reading `{sec, ns, frac32}`: what `rtp` and `phase` equal after alignment, up to the rounding of `inc`.
+  reading `{sec, ns, frac32}`: what `rtp_ts` and `phase` equal after alignment, up to the rounding of `inc`.
 
       iex> ExPtp.RTL.MediaNco.ideal({1, 0, 0}, 48_000, 5) |> Bitwise.bsr(64)
       48_005
@@ -77,9 +78,8 @@ defmodule ExPtp.RTL.MediaNco do
       kscale = input(:kscale, 56)
       align = input(:align, 1)
 
-      tick = output(:tick, 1, reset: 0)
+      %{tick: tick, rtp_ts: rtp} = Ifc.media_clock(:master, reset: 0)
       mclk_en = output(:mclk_en, 1, reset: 0)
-      rtp = output(:rtp, 32, reset: 0)
       phase_o = output(:phase, 64)
       busy_o = output(:busy, 1)
       aligned = output(:aligned, 1, reset: 0)

@@ -93,7 +93,7 @@ defmodule ExPtp.Test.Benches do
 
   @doc "A free-running wallclock feeding `TxInsert`; the time is settable and observable."
   def tx_bench(bits) do
-    axis = Interface.axi_stream(data: bits)
+    axis = ExNet.RTL.Ifc.mac_tx(bits, keep: true)
 
     module "tx_bench_w#{bits}" do
       s = slave(:s_axis, axis)
@@ -169,7 +169,7 @@ defmodule ExPtp.Test.Benches do
               now_frac: 32,
               tick: 1,
               mclk_en: 1,
-              rtp: 32,
+              rtp_ts: 32,
               phase: 64,
               busy: 1,
               aligned: 1
@@ -211,7 +211,7 @@ defmodule ExPtp.Test.Benches do
       outs.now_ns <~ wc.now_ns
       outs.now_frac <~ wc.now_frac
       slew_busy <~ wc.slew_busy
-      for n <- [:tick, :mclk_en, :rtp, :phase, :busy, :aligned], do: outs[n] <~ u[n]
+      for n <- [:tick, :mclk_en, :rtp_ts, :phase, :busy, :aligned], do: outs[n] <~ u[n]
     end
   end
 end

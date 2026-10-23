@@ -1,0 +1,10 @@
+# linuxptp (ptp4l, pmc) from Debian, for the PTP interop tests.
+# /usr/local/lib/fakeclock.so (LD_PRELOAD) makes clock adjustments succeed without
+# CAP_SYS_TIME so that ptp4l's servo can reach s2 in a rootless container.
+FROM docker.io/library/debian:trixie-slim
+COPY fakeclock.c /tmp/fakeclock.c
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linuxptp iproute2 procps gcc libc6-dev \
+ && gcc -shared -fPIC -O2 -o /usr/local/lib/fakeclock.so /tmp/fakeclock.c -ldl \
+ && apt-get purge -y gcc libc6-dev && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/* /tmp/fakeclock.c

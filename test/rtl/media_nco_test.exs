@@ -26,7 +26,7 @@ defmodule ExPtp.RTL.MediaNcoTest do
 
     {rows, _} =
       Enum.map_reduce(cmds, init, fn c, s ->
-        row = %{phase: s.p, rtp: s.r, tick: s.t, mclk_en: s.m}
+        row = %{phase: s.p, rtp_ts: s.r, tick: s.t, mclk_en: s.m}
         inc_eff = if c[:follow] == 1, do: s.incf, else: s.inc
         {carry, np} = Nco.step(s.p, inc_eff)
         kscale = Map.get(c, :kscale, 0)
@@ -77,7 +77,7 @@ defmodule ExPtp.RTL.MediaNcoTest do
       out = T.beam(@mod, stim(cmds)) |> Enum.drop(2)
 
       for {{e, o}, i} <- Enum.zip(model(cmds), out) |> Enum.with_index() do
-        assert Map.take(o, [:phase, :rtp, :tick, :mclk_en]) == e, "cycle #{i}"
+        assert Map.take(o, [:phase, :rtp_ts, :tick, :mclk_en]) == e, "cycle #{i}"
       end
     end
   end
@@ -129,7 +129,7 @@ defmodule ExPtp.RTL.MediaNcoTest do
 
   # ideal minus hardware, signed, modulo 2^96
   defp err(o, c) do
-    hw = o.rtp <<< 64 ||| o.phase
+    hw = o.rtp_ts <<< 64 ||| o.phase
     ideal = MediaNco.ideal({o.now_sec, o.now_ns, o.now_frac}, c.rate, c.offset)
     d = hw - ideal &&& (1 <<< 96) - 1
     if d >= 1 <<< 95, do: d - (1 <<< 96), else: d
@@ -163,8 +163,8 @@ defmodule ExPtp.RTL.MediaNcoTest do
     at = check_aligned(c, out)
     o = Enum.at(out, at)
     t = %Timestamp{seconds: o.now_sec, nanoseconds: o.now_ns}
-    assert o.rtp == MediaClock.rtp_timestamp(t, 48_000, 77)
-    assert o.rtp in 48_077..48_078
+    assert o.rtp_ts == MediaClock.rtp_timestamp(t, 48_000, 77)
+    assert o.rtp_ts in 48_077..48_078
   end
 
   test "a second align after a wallclock step brings the media clock back in line" do

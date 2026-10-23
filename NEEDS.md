@@ -15,13 +15,19 @@
 
 ## ex_net (../ex_net)
 
-- Hardware timestamp interface for the future real `ExPtp.Transport`: ingress timestamp
-  (wallclock at SFD) delivered with each received frame/payload, and an egress timestamp
-  returned or reported for frames sent through the event path (per-frame tag to match).
-- One-step Sync support in the MAC: insert the origin timestamp and update the checksum/FCS
-  for UDP (UDP checksum zero or incremental update) and L2.
+Resolved by the integration wave (contracts in `ExNet.RTL.Ifc`, tests in `test/integration/`):
+
+- Hardware timestamp interface: `rx_sof`, `tx_sof`, `tx_tag` of `MacRx` / `MacTx`, delivered with
+  each frame; the TX tag is the `tuser` of the first beat. Done and tested behind the real MACs.
+- One-step Sync: `TxInsert` in front of `MacTx` writes the timestamp, the MAC appends the FCS
+  afterwards (checked by decoding with the MAC RX model), UDP checksum zeroed. Not done: the
+  incremental checksum update for IPv6 or a nonzero IPv4 checksum.
+
+Still open:
+
 - UDP/IPv4 multicast 224.0.1.129 (ports 319/320) and L2 EtherType 0x88F7 (01:1B:19:00:00:00)
-  filters, and IGMP join for the PTP group.
+  filters for the classifier table in a NIC configuration, and the IGMP join for the PTP group
+  (the classifier can match them; the test table uses `udp_dst_port: 319..320`).
 
 ## Wave 2: RTL (found while writing `lib/ex_ptp/rtl/`)
 
@@ -86,21 +92,22 @@ and passes `ExHdl.RTL.Module` checks, then fails in Verilator `-Wall` (so `Cosim
 
 ### ex_net (../ex_net)
 
-What `ExPtp.RTL.TimestampUnit`, `RxStamp` and `TxInsert` expect (also in their moduledocs):
+What `ExPtp.RTL.TimestampUnit`, `RxStamp` and `TxInsert` expect is now `ExNet.RTL.Ifc` (strobes,
+streams, `tuser` layouts, timing) and is met by `MacRx` / `MacTx` and verified with them:
 
-- `rx_sof` and `tx_sof`: one-cycle strobes in the MAC clock domain at the start-of-frame
-  delimiter on the wire side; `tx_tag` (8 bits) valid in the `tx_sof` cycle, taken from the
-  `tuser` of the first TX beat. At least 8 MAC cycles between two SOFs of one kind.
-- Every `rx_sof` is followed by exactly one frame on the RX AXI4-Stream (bad frames
-  included, flagged by `tuser = 1` on the last beat), in order, none dropped after the SOF.
-  Little endian lanes (byte 0 in `tdata[7:0]`), `tkeep` contiguous from lane 0.
-- TX: the MAC takes the first beat without arbitrary delay and then does not stall; the delay
-  from the first accepted beat to the first bit on the wire is constant (calibrated into
-  `comp`). The FCS is appended after the stream passes `TxInsert` (so it covers the written
-  timestamp), the frame must not carry one. For one-step the TX stream and the wallclock
-  share one clock; for a wallclock on another clock a time replica is needed.
-- Optional MAC option "adjust the UDP checksum at the end of the frame" for IPv6 and for
-  nonzero IPv4 checksums; without it `TxInsert` zeroes the IPv4 UDP checksum.
+- Resolved: `rx_sof` / `tx_sof` offsets and the compensation (`TimestampUnit.nominal_comp/3`, measured
+  error -3.8..+2.6 ns); `tx_tag` from the `tuser` of the first TX beat; RX `tuser` is the MAC's 4 bit
+  field (bit 0 = bad) instead of 1 bit; every `rx_sof` is followed by exactly one frame;
+  `TxInsert` passes `tuser` on; the MAC takes the first beat then does not stall, and a source that
+  pauses goes through a store-and-forward FIFO (`ExNet.RTL.TxPath`); the delay from the first beat
+  accepted by `TxInsert` to the Start word is 2 cycles (`Ifc.tx_first_beat_cycles/0`).
+- Open: the MAC option "adjust the UDP checksum at the end of the frame" for IPv6 and nonzero IPv4
+  checksums (`TxInsert` zeroes the IPv4 UDP checksum).
+- Open: `RxStamp` runs its own `PtpDetect`; the classifier's metadata (ethertype, UDP ports) could
+  replace most of it (about 160 LUT).
+- Open: the integration runs MAC and system on one clock. Between a 156.25 MHz MAC clock and a
+  different system clock the frame stream needs an `ExHdlCores.FIFO.axis_async/1`; the strobe path
+  (pulse synchroniser) is tested with unrelated clocks.
 
 ### ex_hdl_xilinx (../ex_hdl_xilinx)
 
@@ -116,3 +123,91 @@ What `ExPtp.RTL.TimestampUnit`, `RxStamp` and `TxInsert` expect (also in their m
   `slew_ticks`, `set_sec`, ...) then one strobe register; read `snap_*` after a `snap_wr`
   strobe. `ExPtp.RTL.Wallclock` has the strobes and shadow registers; the BAR map is the
   integrator's job.
+
+## Interop findings
+
+From running `ExPtp.Port` against linuxptp 4.2 `ptp4l` and Wireshark 4.4 in containers
+(`mix test --only interop`, README "Interop").
+
+### 1. Bug: default `time_source` is 0xA, IEEE 1588 INTERNAL_OSCILLATOR is 0xA0
+
+`lib/ex_ptp/data_sets.ex` (`TimePropertiesDS` default and its moduledoc) uses `0xA`. The
+TimeSource enumeration (IEEE 1588-2019 table 6) is ATOMIC_CLOCK 0x10, GPS 0x20,
+TERRESTRIAL_RADIO 0x30, PTP 0x40, NTP 0x50, HAND_SET 0x60, OTHER 0x90, INTERNAL_OSCILLATOR 0xA0.
+
+Evidence: ptp4l's Announce carries `time_source: 160` (decoded with `ExPtp.Message`, captured with
+tcpdump from a ptp4l master); the Announce of `ExPtp.Port` is shown by Wireshark as
+`TimeSource: Unknown (0x0a)`.
+
+```elixir
+# mix run -r test/interop/support/interop.ex repro.exs   (needs the tshark image)
+tp = %ExPtp.DataSets.TimeProperties{}
+IO.inspect(tp.time_source)    # 10, should be 160
+# tshark -V on an Announce with time_source 10 prints "TimeSource: Unknown (0x0a)",
+# with 0xA0 it prints the INTERNAL_OSCILLATOR name
+```
+
+Fix: `time_source: 0xA0`. `foreign_masters.ex` and the tests use 0x20 (GPS), which is right.
+
+### 2. Servo gains are the hardware timestamp ones; software timestamps flap the lock
+
+`ExPtp.Servo.gains/1` follows linuxptp's hardware timestamp constants (kp 0.7, ki 0.3 scaled by the
+sync interval). linuxptp's `pi.c` uses `SWTS_KP_SCALE 0.1` and `SWTS_KI_SCALE 0.001` when the timestamps are
+software ones, and its servo waits `0.016 / ki` seconds (16 s) before it estimates the frequency.
+`ExPtp.Port` has no option to change the gains (`ensure_servo/1`).
+
+Evidence (`test/interop/ptp4l_test.exs`, profile `aes67`, test (a)): ptp4l as master with
+`--logSyncInterval=-3`, `ExPtp.Port` slave on `PtpInterop.UdpTransport` (software timestamps). With
+`lock_ns: 100_000` a manual run showed 13 UNCALIBRATED/SLAVE transitions in 40 s, clock error against
+the shared kernel clock up to 380 us and one sample at -1.9 ms. The test uses `lock_ns: 500_000` and
+still sees 8 UNCALIBRATED/SLAVE round trips in 40 s (median error 36 us). At 1 s sync (default
+profile) the port goes SLAVE once and stays there, median error 46 us.
+
+The default `lock_threshold_ns` of 500 cannot be reached with software timestamps (offsets are tens of
+microseconds); the interop tests pass 100 us (default profile) and 500 us (AES67 profile).
+
+Suggestion: a `:servo_gains` option or a `:timestamping` option (`:hardware` | `:software`) that picks
+the gains, and a lock threshold that follows it.
+
+### 3. The UDP transport with software timestamps belongs in lib
+
+`test/interop/support/udp_transport.ex` (`PtpInterop.UdpTransport`) implements `ExPtp.Transport` over UDP/IPv4
+multicast (224.0.1.129, ports 319/320) with the OTP `:socket` module: `SO_TIMESTAMP` (kernel receive
+time, microsecond resolution), transmit timestamp read right before `sendto`, a software clock on top
+of CLOCK_REALTIME with offset, rate (`adjust_frequency/2`) and step (`step_clock/2`), optional TAI
+offset. It should move to `lib/` (the SDR use case will want it anyway). Known weaknesses: the transmit
+timestamp is taken before the send (about 40 us early, visible as a constant offset in ptp4l's log),
+`SO_TIMESTAMPING` with the error queue would fix that; `schedule/3` is millisecond granular (BEAM timers); no
+IPv6, no L2 (0x88F7), no peer delay (224.0.0.107, TTL 1).
+
+### 4. Timescale: the Announce promises TAI, the transport must deliver it
+
+`TimePropertiesDS` defaults to `ptp_timescale: true`, `current_utc_offset: 37`,
+`current_utc_offset_valid: false`. A transport on CLOCK_REALTIME (UTC) then sends timestamps 37 s behind
+the timescale it announces. Evidence: ptp4l as slave logged `master offset 37000028982 s0` until the
+transport added 37 s (`tai_offset_s: 37` in `PtpInterop.UdpTransport`). ptp4l with `-S` as master announces an
+arbitrary timescale (no `ptp_timescale` flag) and sends REALTIME. `ExPtp.Transport.now/1` should say which
+timescale it returns, and `current_utc_offset_valid` should probably follow the transport.
+
+### 5. What matched
+
+- ptp4l (4.2, `-S -E -4`, domain 0) accepted Announce, Sync, Follow_Up and Delay_Resp of `ExPtp.Port`: it went
+  LISTENING, UNCALIBRATED (RS_SLAVE), SLAVE (MASTER_CLOCK_SELECTED) with servo states s0, s1, s2, mean path delay 60 to 75 us, offsets
+  of tens of microseconds (the early transmit timestamp). Default and AES67 intervals.
+- `ExPtp.Port` as slave synchronised to ptp4l masters with both sets of intervals; mean path delay and
+  offset sane. ptp4l's header minorVersionPTP 1 is accepted.
+- BMCA: priority1 (ptp4l lower and port lower), a priority1 change at run time through `pmc`, and the
+  clockIdentity tie break with equal priorities (port identity just below or above ptp4l's) pick the
+  expected master on both sides.
+- Every frame of a ptp4l / `ExPtp.Port` exchange decodes with `ExPtp.Message` and agrees with Wireshark's
+  fields; the Wireshark samples `ptpv2.pcap` and `ptpv2_anon.pcapng` (Sync, Pdelay_Req, Announce) too.
+- ptp4l in an unprivileged container cannot adjust CLOCK_REALTIME, and a failed adjustment resets its
+  servo (it never leaves s0). `containers/linuxptp/fakeclock.c` (LD_PRELOAD) makes `clock_adjtime` and
+  `clock_settime` succeed without touching the clock.
+
+### 6. Not covered
+
+Peer delay (P2P) and transparent clocks, L2 transport against ptp4l (`-2`, not tried), one-step Sync, hardware timestamping, the AES67
+profile's announce timeout and domain constraints on a switch, other implementations (a PTP
+grandmaster, Dante, AVB `gptp`).
+

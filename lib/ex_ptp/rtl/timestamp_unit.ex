@@ -43,11 +43,23 @@ defmodule ExPtp.RTL.TimestampUnit do
   uncertainty is zero; use `capture:` inputs of the wallclock then.
 
   `compensate/2` is the arithmetic as an Elixir model.
+
+  ## Reference point and nominal compensation
+
+  The stamp is meant to be the wallclock at the Start word on the wire: for RX the MAC clock
+  edge that samples the Start word on the pins (`ExNet.RTL.MacRx.rx_sof` follows
+  `ExNet.RTL.Ifc.rx_sof_cycles/0` cycle later), for TX the edge at which the PHY samples the
+  Start word (`tx_sof` is high in that Start word's cycle, offset
+  `ExNet.RTL.Ifc.tx_sof_cycles/0`). `nominal_comp/3` is the compensation for that:
+  the `:sys` capture latency (mean 2.5 periods, 2 to 3) plus the MAC's strobe offset.
+  The remaining error is the capture jitter, at most half a `:sys` period either way,
+  plus the PHY and gearbox delay of a real board (add it to the nominal value).
   """
   use ExHdl.RTL
   import Bitwise
 
   alias ExHdl.RTL.CDC
+  alias ExNet.RTL.Ifc, as: NetIfc
 
   @ns 1_000_000_000
   @wrap @ns <<< 16
@@ -69,15 +81,34 @@ defmodule ExPtp.RTL.TimestampUnit do
     end
   end
 
+  @doc """
+  Nominal `rx_comp` / `tx_comp` (u32, 2^-16 ns) for MAC and system clock periods in ns:
+  the mean capture latency of the clock domain crossing, 2.5 `:sys` periods, plus for
+  RX the MAC cycles `rx_sof` trails the pins (`ExNet.RTL.Ifc.rx_sof_cycles/0`, 1) and for
+  TX `ExNet.RTL.Ifc.tx_sof_cycles/0` (0). Measured: the stamp equals the wallclock at the edge
+  that samples the Start word within +-0.5 `:sys` periods (`test/integration/mac_timestamp_test.exs`).
+
+      iex> Float.round(ExPtp.RTL.TimestampUnit.nominal_comp(:tx, 6.4, 8.0) / 65536, 3)
+      20.0
+      iex> Float.round(ExPtp.RTL.TimestampUnit.nominal_comp(:rx, 6.4, 8.0) / 65536, 3)
+      26.4
+  """
+  def nominal_comp(side, mac_period_ns, sys_period_ns) when side in [:rx, :tx] do
+    cycles = if side == :rx, do: NetIfc.rx_sof_cycles(), else: NetIfc.tx_sof_cycles()
+    round((2.5 * sys_period_ns + cycles * mac_period_ns) * 65536)
+  end
+
   def build(opts \\ []) do
     tag = Keyword.get(opts, :tag_bits, 8)
 
     module "ptp_timestamp_unit_t#{tag}" do
       domain(:mac, clock: :clk_mac, reset: :rst_mac_n)
       domain(:sys)
-      rx_sof = input(:rx_sof, 1, domain: :mac)
-      tx_sof = input(:tx_sof, 1, domain: :mac)
-      tx_tag = input(:tx_tag, tag, domain: :mac)
+      rx = slave(:rx, NetIfc.ts_rx(), domain: :mac)
+      tx = slave(:tx, NetIfc.ts_tx(tag), domain: :mac)
+      rx_sof = rx.sof
+      tx_sof = tx.sof
+      tx_tag = tx.tag
       now_sec = input(:now_sec, 48, domain: :sys)
       now_ns = input(:now_ns, 32, domain: :sys)
       now_frac = input(:now_frac, 32, domain: :sys)

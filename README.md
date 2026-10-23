@@ -22,13 +22,15 @@ a closed loop with two clocks (see "Hardware").
 | Wallclock | `ExPtp.Wallclock`, `ExPtp.RTL.Wallclock` | done (model, RTL bit-exact) |
 | PI servo, lock detection | `ExPtp.Servo` (`pi_step`, `lock_step` scan kernels), `ExPtp.Servo.FixedPI`, `.PI`, `.Lock`, `ExPtp.RTL.Servo`, `ExPtp.RTL.Offset` | done (model, RTL) |
 | Media clock: RTP timestamp, NCO | `ExPtp.MediaClock`, `ExPtp.RTL.MediaNco` | done (model, RTL) |
-| Timestamp unit, PTP detection, one-step Sync insertion | `ExPtp.RTL.TimestampUnit`, `.PtpDetect`, `.RxStamp`, `.TxInsert` | done (RTL), untested on a MAC (ex_net is in progress) |
+| Timestamp unit, PTP detection, one-step Sync insertion | `ExPtp.RTL.TimestampUnit`, `.PtpDetect`, `.RxStamp`, `.TxInsert` | done (RTL), tested behind the ex_net MAC (`test/integration/`) |
 | Peer delay mechanism in the port, management messages, one-way/multi-port clocks | | not done |
 | Validation against ptp4l | | not done |
-| Real transport (MAC timestamps over ex_net, PCIe wallclock access) | | waits for ex_net |
+| Real transport (MAC timestamps over ex_net, PCIe wallclock access) | | the timestamp path is tested through the MAC; the `ExPtp.Transport` glue and PCIe access are not written |
 
-Not depending on ex_net yet: PTP messages are plain payloads (UDP ports 319
-and 320, or L2 with EtherType 0x88F7); framing is the transport's job.
+ex_net is a (path) dependency for the shared interfaces (`ExNet.RTL.Ifc`: MAC receive and
+transmit streams, `rx_sof` / `tx_sof` / `tx_tag`); the BEAM side still treats PTP
+messages as plain payloads (UDP ports 319 and 320, or L2 with EtherType 0x88F7), framing
+is the transport's job.
 
 ## API overview
 
@@ -79,13 +81,14 @@ lanes (byte 0 in `tdata[7:0]`).
 | Module | What | Ports (besides clock and `rst_n`) |
 |---|---|---|
 | `RTL.Wallclock` | 48-bit s, 30-bit ns, 32-bit fraction; `ExPtp.Wallclock` bit for bit | strobes `inc_wr`, `set_wr`, `step_wr`, `slew_wr`, `snap_wr`, `cap`, `cap_clr` with operands; outputs `now_*`, `snap_*`, `cap<i>_*`, `pps`, `pps_tick`, `slew_busy` |
-| `RTL.TimestampUnit` | SOF to wallclock capture, MAC clock to system clock, compensation, TX tag FIFO | MAC domain `rx_sof`, `tx_sof`, `tx_tag`; `now_*`, `rx_comp`, `tx_comp`; `rx_valid`, `rx_ts`, `tx_ts_valid`, `tx_ts_tag`, `tx_ts`, `tx_pop` |
+| `RTL.TimestampUnit` | SOF to wallclock capture, MAC clock to system clock, compensation, TX tag FIFO | MAC domain `rx_sof`, `tx_sof`, `tx_tag` (`ExNet.RTL.Ifc.ts_rx/0`, `ts_tx/1`); `now_*`, `rx_comp`, `tx_comp`; `rx_valid`, `rx_ts`, `tx_ts_valid`, `tx_ts_tag`, `tx_ts`, `tx_pop`; `nominal_comp/3` |
 | `RTL.PtpDetect` | EtherType 0x88F7 or UDP 319/320 after 0-2 VLAN tags, passive tap | `valid`, `data`, `keep`, `last`; `ptp`, `udp`, `mtype`, `ptp_off`, `ev_port`, `l4_off` |
-| `RTL.RxStamp` | RX frames with timestamp and classification in `tuser` (102 bits, `RTL.Meta`) | `s_axis` (user 1), `m_axis` (user 102), `ts_valid`, `ts` |
-| `RTL.TxInsert` | one-step Sync: origin timestamp written in the stream, UDP checksum zeroed | `s_axis`, `m_axis`, `enable`, `zero_csum`, `comp`, `now_*`, `stamped` |
+| `RTL.RxStamp` | RX frames with timestamp and classification in `tuser` (102 bits, `RTL.Meta`) | `s_axis` (`ExNet.RTL.Ifc.mac_rx` with `tready`, bit 0 of the 4 bit user = bad), `m_axis` (user 102), `ts_valid`, `ts` |
+| `RTL.TxInsert` | one-step Sync: origin timestamp written in the stream, UDP checksum zeroed | `s_axis`, `m_axis` (`ExNet.RTL.Ifc.mac_tx`, tag in `tuser` passed through), `enable`, `zero_csum`, `comp`, `now_*`, `stamped` |
 | `RTL.Offset` | `Delay` offset and mean path delay from t1..t4 | `go`, `t1..t4` (94 bit), `valid`, `err`, `mpd` |
 | `RTL.Servo` | `pi_step` kernel (wrapped), lock detector, ppb to increment | `err_valid`, `err`, `load`, `kp`, `ki`, `nominal`, `scale`, `thr*`, `needed`; `inc_wr`, `inc`, `ppb`, `locked` |
-| `RTL.MediaNco` | sample tick, RTP timestamp, MCLK enable, alignment to PTP time | `now_*`, `rate`, `offset`, `inc_wr`/`inc_in` or `follow` + `wc_inc` + `kscale`, `align`; `tick`, `rtp`, `mclk_en`, `aligned` |
+| `RTL.Ifc` | the media clock contract (`tick`, `rtp_ts`), pointers to `Meta` and the MAC strobes | `media_clock(:master \| :slave)` |
+| `RTL.MediaNco` | sample tick, RTP timestamp, MCLK enable, alignment to PTP time | `now_*`, `rate`, `offset`, `inc_wr`/`inc_in` or `follow` + `wc_inc` + `kscale`, `align`; `tick`, `rtp_ts`, `mclk_en`, `aligned` (`RTL.Ifc.media_clock/2`) |
 
 Moduledocs have the details; the points that matter for integration:
 
@@ -98,13 +101,18 @@ tick). The value of cycle i is the model after i ticks. One cycle critical
 path: increment + slew share + step added to a 62-bit value, second carry.
 
 **Timestamp path.** The wallclock runs on the system clock; `rx_sof` and
-`tx_sof` (one-cycle strobes at the SFD, the interface ex_net provides) cross
+`tx_sof` (one-cycle strobes of `ExNet.RTL.MacRx` / `MacTx`, defined in `ExNet.RTL.Ifc`) cross
 with a toggle pulse synchroniser, the tag as a held register sampled after the
 pulse (a `cdc: true` register; needs a max-delay constraint). Capture happens
 2 to 3 system periods after the SOF (measured 16 to 23 ns at 8 ns), jittering
 by one system period, because the clocks are asynchronous: `rx_comp`/`tx_comp`
-(2^-16 ns) subtract the mean latency. With the wallclock on the MAC clock no
-crossing is needed. `RxStamp` queues the timestamps and waits for the first beat's
+(2^-16 ns) subtract the mean latency; `TimestampUnit.nominal_comp(side, mac_period_ns,
+sys_period_ns)` is that latency (2.5 system periods) plus the MAC's strobe offset (RX: the
+`rx_sof` trails the Start word by 1 MAC cycle, TX: 0), which makes a stamp the wallclock at
+the edge that samples the Start word on the wire. Measured behind the real MACs on
+unrelated clocks (8 ns system, 6.4 ns MAC): error -3.8 to +2.6 ns for RX and TX
+(`test/integration/mac_timestamp_test.exs`). With one clock the capture is exactly 3 cycles
+after the strobe's cycle. With the wallclock on the MAC clock no crossing is needed. `RxStamp` queues the timestamps and waits for the first beat's
 one; frames out of order or a lost SOF are handled (late timestamps are
 discarded after `wait` cycles), the contract with the MAC is in the moduledoc.
 
@@ -130,7 +138,7 @@ one unit of `Wallclock.increment/2`).
 tick on carry, RTP counter, `mclk_en` when the top 8 phase bits change: 256 per
 sample, phase locked). `align` latches the wallclock and computes
 `floor(t * rate) + offset` and the phase fraction with a 82-cycle sequential
-divider, then loads the accumulator advanced by the elapsed cycles, so `rtp`
+divider, then loads the accumulator advanced by the elapsed cycles, so `rtp_ts`
 and `phase` agree with the wallclock of the same cycle from `aligned` on
 (tested at 48, 44.1, 96 and 8 kHz against exact integer arithmetic). In
 `follow` mode the increment is derived from the wallclock's increment, so the
@@ -147,6 +155,10 @@ wallclock step.
 | Servo vs `FixedPI`/`Lock`/`inc_for` | identical PI output, increment and lock state per sample (Verilator) |
 | `Offset` vs `Delay` and `FixedPI.err_from_scaled` | identical |
 | `MediaNco` | equal to `Nco.step` per cycle; aligned within 1e-12 sample of exact |
+| MAC TX (`ExNet.RTL.MacTx`) with `TimestampUnit`, two unrelated clocks | tag of every frame in order, stamp = wallclock at the Start word edge within -3.8..+2.6 ns |
+| MAC RX (`ExNet.RTL.MacRx`) with `TimestampUnit`, two unrelated clocks | stamp of every frame = wallclock at the Start word edge within -3.8..+2.6 ns |
+| `TxInsert` with `MacTx`, one clock | Sync origin timestamp = wallclock (whole ns) at the Start word edge, UDP checksum 0 on event ports, FCS valid (decoded by the MAC RX model), other frames unchanged |
+| ex_aes67 `test/integration/` | RX frames (random VLAN, bad FCS, other traffic) and TX frames through the full chains: exact timestamps, one-step equals two-step |
 
 **Closed loop** (`test/rtl/closed_loop_test.exs`, Verilator, about 30 s): a
 master and a slave wallclock on unrelated clocks (4.17 MHz nominal, to keep the
@@ -219,3 +231,44 @@ targets, tool drivers). Function lives in these siblings:
 ./scripts/checkout_siblings.sh   # path dependencies
 mix test
 ```
+
+## Interop
+
+`mix test --only interop` runs the codecs and `ExPtp.Port` against real implementations (excluded
+from `mix test`). Needs rootless podman and, for the first run, network access (image build, Wireshark
+sample captures cached in `$TMPDIR/ex_interop_captures`; a failed download skips the test).
+
+```sh
+containers/build.sh            # tshark, linuxptp (ptp4l 4.2), beam (Elixir 1.18.3), nettools (tcpdump); Debian trixie
+mix test --only interop        # about 9 minutes
+```
+
+The BEAM side of the ptp4l tests runs in an Elixir container on a podman network with `_build/<env>/lib`
+mounted (`mix test` compiles first) and `ExPtp.Port` over `test/interop/support/udp_transport.ex`: UDP/IPv4
+multicast, `SO_TIMESTAMP` receive and pre-`sendto` transmit software timestamps, a software clock that the servo
+steers on top of CLOCK_REALTIME (NEEDS.md: this belongs in `lib/`). All containers share the host
+kernel clock, so the port clock minus CLOCK_REALTIME is the true synchronisation error.
+
+| Test | Against | Result |
+|---|---|---|
+| `tshark_test.exs` | tshark `-T json`: all ten message types (Sync, Delay_Req, Follow_Up, Delay_Resp, Pdelay_Req/Resp/Resp_Follow_Up, Announce with PATH_TRACE, Signaling, Management) over UDP (319/320, checksums verified), over Ethernet 0x88F7 and with an 802.1Q tag | no malformed or expert warnings, every header and body field and every flag equal, correctionField incl. negative and fractional, padded frames, a truncated message is flagged by Wireshark and rejected by `Message.decode/1` |
+| `tshark_test.exs`, reverse | Wireshark samples `ptpv2.pcap` (Sync, Pdelay_Req, Announce) and `ptpv2_anon.pcapng`, converted by tshark | all messages decode and agree with tshark |
+| `ptp4l_test.exs` (a) | ptp4l master (`--serverOnly`), `ExPtp.Port` slave, default and AES67 intervals | LISTENING, UNCALIBRATED, SLAVE; follows ptp4l's clockIdentity; median clock error 36 to 46 us, mean path delay 64 to 71 us. AES67 profile (8 Hz): the port flaps UNCALIBRATED/SLAVE (NEEDS.md, "Interop findings" 2) |
+| (b) | `ExPtp.Port` master, ptp4l slave (`--clientOnly`) | ptp4l logs `LISTENING to UNCALIBRATED on RS_SLAVE`, `UNCALIBRATED to SLAVE on MASTER_CLOCK_SELECTED`, servo s0, s1, s2; median offset 36 to 38 us, path delay 64 to 67 us |
+| (c1) to (c4) | BMCA: priority1 on either side, priority1 raised on ptp4l at run time with `pmc`, clockIdentity tie break (port identity just below or above ptp4l's) | the expected master on both sides in every case |
+| (d) | tcpdump in ptp4l's namespace during (a) | every frame decodes with `ExPtp.Message` and matches Wireshark's fields |
+
+What the setup needed and what it cannot do:
+
+- ptp4l cannot adjust CLOCK_REALTIME in an unprivileged container and then never leaves servo state s0.
+  `containers/linuxptp/fakeclock.c` (LD_PRELOAD) makes `clock_adjtime` succeed without touching the clock, so s1 and s2
+  appear; ptp4l's offsets are the real offsets. ptp4l's software timestamp servo takes about 11 s to reach s2.
+- A master that announces the PTP timescale must send TAI: the transport takes `tai_offset_s: 37`
+  (otherwise ptp4l reports 37 s offset). The slave side follows ptp4l's `-S` master, which announces an
+  arbitrary timescale.
+- Software timestamps on a shared host: offsets are tens of microseconds with outliers up to milliseconds,
+  so the assertions are loose (medians below 150 to 500 us).
+- No peer delay, L2, one-step, hardware timestamps or other implementations, see NEEDS.md.
+- Findings: `time_source` default 0xA should be 0xA0 (a real bug), servo gains for software timestamps,
+  transport to move to `lib/`, timescale of the transport.
+

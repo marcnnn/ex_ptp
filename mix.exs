@@ -22,7 +22,7 @@ defmodule ExPtp.MixProject do
   defp deps do
     [
       {:ex_hdl, path: "../exhdl"},
-      # ex_net is not used yet (ex_net is being written in parallel); PTP messages are plain payloads
+      {:ex_net, path: "../ex_net"},
       {:nx_fixed, path: "../nx_fixed"},
       {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]

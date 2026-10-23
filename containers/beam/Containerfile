@@ -1,0 +1,5 @@
+# Elixir 1.18.3 / OTP 27 to run the BEAM side of the PTP interop tests
+# (the repositories are mounted at /work, see test/interop/support/containers.ex).
+FROM docker.io/library/elixir:1.18.3
+RUN mix local.hex --force && mix local.rebar --force
+ENV MIX_ENV=test
