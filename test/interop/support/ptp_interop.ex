@@ -170,6 +170,18 @@ defmodule Interop.Ptp do
   end
 
   @doc "Clock identity ptp4l selected as best master (e.g. `eeeeee.fffe.000001`)."
+  @doc "Logs of `name` once ptp4l has logged its best master choice (polls up to 10 s)."
+  def logs_with_best_master(name, tries \\ 20) do
+    log = logs(name)
+
+    if best_master(log) == nil and tries > 0 do
+      Process.sleep(500)
+      logs_with_best_master(name, tries - 1)
+    else
+      log
+    end
+  end
+
   def best_master(log) do
     case Regex.scan(
            ~r/selected (?:best master clock|local clock) (\S+?)(?: as best master)?\n/,

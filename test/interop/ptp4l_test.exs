@@ -55,7 +55,7 @@ defmodule ExPtp.Interop.Ptp4lTest do
             id: 1
           )
 
-        log = Ptp.logs(p4)
+        log = Ptp.logs_with_best_master(p4)
         states = for {:state, new, old, _} <- events, do: {old, new}
         assert {:listening, :uncalibrated} in states
         assert {:uncalibrated, :slave} in states
