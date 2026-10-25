@@ -149,45 +149,40 @@ IO.inspect(tp.time_source)    # 10, should be 160
 
 Fix: `time_source: 0xA0`. `foreign_masters.ex` and the tests use 0x20 (GPS), which is right.
 
-### 2. Servo gains are the hardware timestamp ones; software timestamps flap the lock
+### 2. Fixed: servo profile for software timestamps
 
-`ExPtp.Servo.gains/1` follows linuxptp's hardware timestamp constants (kp 0.7, ki 0.3 scaled by the
-sync interval). linuxptp's `pi.c` uses `SWTS_KP_SCALE 0.1` and `SWTS_KI_SCALE 0.001` when the timestamps are
-software ones, and its servo waits `0.016 / ki` seconds (16 s) before it estimates the frequency.
-`ExPtp.Port` has no option to change the gains (`ensure_servo/1`).
+`ExPtp.Servo.Profile` (`:hardware`, `:software`) holds the gains, lock threshold and count, unlock
+factor, step threshold, mean path delay filter and the outlier filter (`ExPtp.Servo.Outlier`). The
+software profile uses linuxptp's software gains (`SWTS_KP_SCALE 0.1`, `SWTS_KI_SCALE 0.001`), locks
+within 100 us (unlocks above 300 us), rejects offsets far outside the recent median, steps at 1 ms.
+`ExPtp.Port` picks it from `:timestamping` or from the transport's `timestamping/1` callback
+(`:hardware` when absent), every value can be overridden by a port option (`:servo_gains`,
+`:lock_threshold_ns`, ...). The hardware defaults are unchanged.
 
-Evidence (`test/interop/ptp4l_test.exs`, profile `aes67`, test (a)): ptp4l as master with
-`--logSyncInterval=-3`, `ExPtp.Port` slave on `PtpInterop.UdpTransport` (software timestamps). With
-`lock_ns: 100_000` a manual run showed 13 UNCALIBRATED/SLAVE transitions in 40 s, clock error against
-the shared kernel clock up to 380 us and one sample at -1.9 ms. The test uses `lock_ns: 500_000` and
-still sees 8 UNCALIBRATED/SLAVE round trips in 40 s (median error 36 us). At 1 s sync (default
-profile) the port goes SLAVE once and stays there, median error 46 us.
+Interop test (a), ptp4l master with `--logSyncInterval=-3`, 40 s: the port goes SLAVE once and the
+test asserts that no state change follows. Before: 8 to 13 UNCALIBRATED/SLAVE round trips.
 
-The default `lock_threshold_ns` of 500 cannot be reached with software timestamps (offsets are tens of
-microseconds); the interop tests pass 100 us (default profile) and 500 us (AES67 profile).
+Still open: the transmit timestamp is taken before `sendto` (see 3), which leaves a clock error of
+tens of microseconds against the kernel clock (median 57-88 us in the runs, ptp4l's own raw offsets
+as slave are similar). The profile's numbers are not tuned beyond that.
 
-Suggestion: a `:servo_gains` option or a `:timestamping` option (`:hardware` | `:software`) that picks
-the gains, and a lock threshold that follows it.
+### 3. Fixed: the UDP transport with software timestamps is in lib
 
-### 3. The UDP transport with software timestamps belongs in lib
+`ExPtp.Transport.Udp` (`lib/ex_ptp/transport/udp.ex`, moved from the interop support). Known
+weaknesses stay: the transmit timestamp is taken before the send (about 40 us early),
+`SO_TIMESTAMPING` with the error queue would fix that; `schedule/3` is millisecond granular (BEAM
+timers); no IPv6, no L2 (0x88F7), no peer delay (224.0.0.107, TTL 1).
 
-`test/interop/support/udp_transport.ex` (`PtpInterop.UdpTransport`) implements `ExPtp.Transport` over UDP/IPv4
-multicast (224.0.1.129, ports 319/320) with the OTP `:socket` module: `SO_TIMESTAMP` (kernel receive
-time, microsecond resolution), transmit timestamp read right before `sendto`, a software clock on top
-of CLOCK_REALTIME with offset, rate (`adjust_frequency/2`) and step (`step_clock/2`), optional TAI
-offset. It should move to `lib/` (the SDR use case will want it anyway). Known weaknesses: the transmit
-timestamp is taken before the send (about 40 us early, visible as a constant offset in ptp4l's log),
-`SO_TIMESTAMPING` with the error queue would fix that; `schedule/3` is millisecond granular (BEAM timers); no
-IPv6, no L2 (0x88F7), no peer delay (224.0.0.107, TTL 1).
+### 4. Fixed: timescale
 
-### 4. Timescale: the Announce promises TAI, the transport must deliver it
-
-`TimePropertiesDS` defaults to `ptp_timescale: true`, `current_utc_offset: 37`,
-`current_utc_offset_valid: false`. A transport on CLOCK_REALTIME (UTC) then sends timestamps 37 s behind
-the timescale it announces. Evidence: ptp4l as slave logged `master offset 37000028982 s0` until the
-transport added 37 s (`tai_offset_s: 37` in `PtpInterop.UdpTransport`). ptp4l with `-S` as master announces an
-arbitrary timescale (no `ptp_timescale` flag) and sends REALTIME. `ExPtp.Transport.now/1` should say which
-timescale it returns, and `current_utc_offset_valid` should probably follow the transport.
+`ExPtp.Transport` has optional callbacks `timescale/1` (`:ptp`, `{:ptp, utc_offset, valid}` or
+`:arb`) and `timestamping/1`. `ExPtp.Port` derives the announced `TimePropertiesDS` from the transport
+(`ptp_timescale`, `current_utc_offset`, `current_utc_offset_valid`) unless `:time_properties` is
+given; a transport without the callback means PTP timescale, offset 37, not valid. `ExPtp.Transport.Udp`
+delivers TAI (CLOCK_REALTIME plus `:tai_offset_s`, 37) by default; `timescale: :arb` keeps
+CLOCK_REALTIME and announces an arbitrary timescale, as ptp4l `-S`. Not done: reading the kernel's
+CLOCK_TAI offset, and following the grandmaster's UTC offset or timescale flag when the port is a
+slave (the transport keeps its own).
 
 ### 5. What matched
 
@@ -220,4 +215,3 @@ grandmaster, Dante, AVB `gptp`).
 - The delay paths are closed loop in `ExPtp.Sim` (BEAM, drift, jitter); not yet through the Cosim session
   API (`ExHdl.RTL.Cosim` open/poke/peek/step) against the RTL servo/timestamp unit.
 - Profile numbers still unverified against AES67 / ST 2059-2 text (see `ExPtp.Profile` moduledoc).
-- Interop items 2-4 (software timestamp gains, UDP transport in lib, timescale) still open.

@@ -15,6 +15,8 @@ defmodule ExPtp.ModelsTest do
   doctest ExPtp.Servo.FixedPI
   doctest ExPtp.Servo.PI
   doctest ExPtp.Servo.Lock
+  doctest ExPtp.Servo.Profile
+  doctest ExPtp.Servo.Outlier
 
   defp ts(ns), do: Timestamp.from_ns(ns)
 

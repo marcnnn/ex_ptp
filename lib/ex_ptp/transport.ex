@@ -40,6 +40,42 @@ defmodule ExPtp.Transport do
   @doc "Steps the clock phase by `delta_ns` (signed)."
   @callback step_clock(handle, delta_ns :: integer) :: :ok
 
+  @doc """
+  Kind of timestamps the transport delivers, `:hardware` (default) or `:software`;
+  picks the servo profile (`ExPtp.Servo.Profile`). Optional.
+  """
+  @callback timestamping(handle) :: :hardware | :software
+
+  @doc """
+  Timescale of `now/1`: `:ptp` (TAI, what an Announce with `ptp_timescale` promises;
+  default) or `:arb` (arbitrary, e.g. a free running or UTC clock). `utc_offset` is
+  TAI minus UTC in seconds and `valid` says whether the transport knows it. Optional.
+  """
+  @callback timescale(handle) ::
+              :ptp | :arb | {:ptp, utc_offset :: integer, valid :: boolean}
+
+  @optional_callbacks timestamping: 1, timescale: 1
+
+  @doc "Timestamping kind of a transport (`:hardware` unless it says otherwise)."
+  def timestamping({mod, handle}) do
+    if Code.ensure_loaded?(mod) and function_exported?(mod, :timestamping, 1),
+      do: mod.timestamping(handle),
+      else: :hardware
+  end
+
+  @doc """
+  Timescale of a transport as `{:ptp, utc_offset, valid}` or `:arb` (the PTP timescale
+  with offset 37 and not valid unless it says otherwise).
+  """
+  def timescale({mod, handle}) do
+    r =
+      if Code.ensure_loaded?(mod) and function_exported?(mod, :timescale, 1),
+        do: mod.timescale(handle),
+        else: :ptp
+
+    if r == :ptp, do: {:ptp, 37, false}, else: r
+  end
+
   @doc "Message channel (`:event` or `:general`) for a message type."
   def channel(type) when type in [:sync, :delay_req, :pdelay_req, :pdelay_resp], do: :event
   def channel(_), do: :general

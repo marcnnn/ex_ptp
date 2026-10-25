@@ -1,27 +1,32 @@
-defmodule PtpInterop.UdpTransport do
+defmodule ExPtp.Transport.Udp do
   @moduledoc """
-  An `ExPtp.Transport` over real UDP/IPv4 multicast sockets (224.0.1.129, event
-  port 319, general port 320) with software timestamps, for the interop tests
-  against linuxptp. Test support only; it belongs in `lib/` (see NEEDS.md,
-  "Interop findings").
+  An `ExPtp.Transport` over UDP/IPv4 multicast sockets (224.0.1.129, event port
+  319, general port 320) with software timestamps. Used by the interop tests
+  against linuxptp; no privileges needed beyond binding ports 319 and 320.
 
   Timestamps:
 
   - receive: `SO_TIMESTAMP` (kernel, CLOCK_REALTIME, microseconds), mapped to
     the port's clock;
   - transmit: `System.os_time/1` read immediately before `sendto` (no
-    `SO_TIMESTAMPING` error queue), mapped to the port's clock.
+    `SO_TIMESTAMPING` error queue), mapped to the port's clock. This is about
+    40 us early; `ExPtp.Servo.Profile` `:software` is meant for that jitter.
 
   The port's clock is a software clock on top of CLOCK_REALTIME with an offset
   and a rate adjustment, so the servo can steer it without privileges
-  (`adjust_frequency/2`, `step_clock/2`). `clock_error_ns/1` is that clock minus
-  CLOCK_REALTIME, which is zero when it agrees with a master that also uses
-  CLOCK_REALTIME (all containers share the host kernel clock). Option
-  `:tai_offset_s` adds the TAI-UTC offset so the port's clock is in the PTP
-  timescale (what an Announce with `ptp_timescale` promises); `clock_error_ns/1`
-  leaves it out.
+  (`adjust_frequency/2`, `step_clock/2`).
 
-  Start with `start_link(iface_ip: {10, 89, 0, 2})`; the handle for
+  Timescale (see `ExPtp.Transport.timescale/1`): by default the clock is TAI,
+  CLOCK_REALTIME plus `:tai_offset_s` (37), because the Announce of a port on
+  this transport promises the PTP timescale; `:utc_offset_valid` (false) says whether
+  that offset is announced as known. With `timescale: :arb` the clock is
+  CLOCK_REALTIME as it is and the Announce says arbitrary timescale (what ptp4l
+  does with `-S`). `clock_error_ns/1` is the port's clock minus CLOCK_REALTIME
+  minus the TAI offset, zero when it agrees with a master that uses CLOCK_REALTIME
+  (all containers share the host kernel clock).
+
+  Start with `start_link(iface_ip: {10, 89, 0, 2})` (options `:group`, `:event_port` and
+  `:general_port` for tests without privileges); the handle for
   `ExPtp.Port` is the pid.
   """
   use GenServer
@@ -39,7 +44,11 @@ defmodule PtpInterop.UdpTransport do
     :general,
     :owner,
     :dest,
+    ports: {@ptp_event, @ptp_general},
     tai_ns: 0,
+    timescale: :ptp,
+    utc_valid: false,
+    tai_s: 37,
     off_ns: 0.0,
     ppb: 0.0,
     t0: 0,
@@ -65,6 +74,12 @@ defmodule PtpInterop.UdpTransport do
   def adjust_frequency(pid, ppb), do: GenServer.call(pid, {:freq, ppb})
 
   @impl ExPtp.Transport
+  def timestamping(_pid), do: :software
+
+  @impl ExPtp.Transport
+  def timescale(pid), do: GenServer.call(pid, :timescale)
+
+  @impl ExPtp.Transport
   def step_clock(pid, delta_ns), do: GenServer.call(pid, {:step, delta_ns})
 
   @doc "The port's clock minus CLOCK_REALTIME, in ns."
@@ -78,11 +93,28 @@ defmodule PtpInterop.UdpTransport do
   def init(opts) do
     iface = Keyword.fetch!(opts, :iface_ip)
     group = Keyword.get(opts, :group, @group)
-    {:ok, ev} = open(iface, group, @ptp_event)
-    {:ok, ge} = open(iface, group, @ptp_general)
+    ev_port = Keyword.get(opts, :event_port, @ptp_event)
+    ge_port = Keyword.get(opts, :general_port, @ptp_general)
+    {:ok, ev} = open(iface, group, ev_port)
+    {:ok, ge} = open(iface, group, ge_port)
 
-    tai = Keyword.get(opts, :tai_offset_s, 0) * 1_000_000_000
-    s = %__MODULE__{iface: iface, event: ev, general: ge, dest: group, t0: real(), tai_ns: tai}
+    scale = Keyword.get(opts, :timescale, :ptp)
+    tai_s = Keyword.get(opts, :tai_offset_s, 37)
+    tai = if scale == :ptp, do: tai_s * 1_000_000_000, else: 0
+
+    s = %__MODULE__{
+      iface: iface,
+      event: ev,
+      general: ge,
+      dest: group,
+      ports: {ev_port, ge_port},
+      t0: real(),
+      tai_ns: tai,
+      timescale: scale,
+      tai_s: tai_s,
+      utc_valid: Keyword.get(opts, :utc_offset_valid, false)
+    }
+
     {:ok, s |> arm(ev) |> arm(ge)}
   end
 
@@ -117,14 +149,19 @@ defmodule PtpInterop.UdpTransport do
   def handle_call({:attach, owner}, _from, s), do: {:reply, :ok, %{s | owner: owner}}
   def handle_call(:now, _from, s), do: {:reply, Timestamp.from_ns(virtual(s, real())), s}
 
+  def handle_call(:timescale, _from, %{timescale: :ptp} = s),
+    do: {:reply, {:ptp, s.tai_s, s.utc_valid}, s}
+
+  def handle_call(:timescale, _from, s), do: {:reply, :arb, s}
+
   def handle_call(:clock_error, _from, s) do
     r = real()
     {:reply, virtual(s, r) - r - s.tai_ns, s}
   end
 
   def handle_call({:send, channel, bin}, _from, s) do
-    {sock, port} =
-      if channel == :event, do: {s.event, @ptp_event}, else: {s.general, @ptp_general}
+    {ev_port, ge_port} = s.ports
+    {sock, port} = if channel == :event, do: {s.event, ev_port}, else: {s.general, ge_port}
 
     t = real()
     :ok = :socket.sendto(sock, bin, %{family: :inet, addr: s.dest, port: port})

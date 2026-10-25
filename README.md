@@ -244,16 +244,17 @@ mix test --only interop        # about 9 minutes
 ```
 
 The BEAM side of the ptp4l tests runs in an Elixir container on a podman network with `_build/<env>/lib`
-mounted (`mix test` compiles first) and `ExPtp.Port` over `test/interop/support/udp_transport.ex`: UDP/IPv4
+mounted (`mix test` compiles first) and `ExPtp.Port` over `ExPtp.Transport.Udp` (`lib/ex_ptp/transport/udp.ex`): UDP/IPv4
 multicast, `SO_TIMESTAMP` receive and pre-`sendto` transmit software timestamps, a software clock that the servo
-steers on top of CLOCK_REALTIME (NEEDS.md: this belongs in `lib/`). All containers share the host
+steers on top of CLOCK_REALTIME, TAI by default. It declares software timestamps, so the port uses the
+`:software` `ExPtp.Servo.Profile`. All containers share the host
 kernel clock, so the port clock minus CLOCK_REALTIME is the true synchronisation error.
 
 | Test | Against | Result |
 |---|---|---|
 | `tshark_test.exs` | tshark `-T json`: all ten message types (Sync, Delay_Req, Follow_Up, Delay_Resp, Pdelay_Req/Resp/Resp_Follow_Up, Announce with PATH_TRACE, Signaling, Management) over UDP (319/320, checksums verified), over Ethernet 0x88F7 and with an 802.1Q tag | no malformed or expert warnings, every header and body field and every flag equal, correctionField incl. negative and fractional, padded frames, a truncated message is flagged by Wireshark and rejected by `Message.decode/1` |
 | `tshark_test.exs`, reverse | Wireshark samples `ptpv2.pcap` (Sync, Pdelay_Req, Announce) and `ptpv2_anon.pcapng`, converted by tshark | all messages decode and agree with tshark |
-| `ptp4l_test.exs` (a) | ptp4l master (`--serverOnly`), `ExPtp.Port` slave, default and AES67 intervals | LISTENING, UNCALIBRATED, SLAVE; follows ptp4l's clockIdentity; median clock error 36 to 46 us, mean path delay 64 to 71 us. AES67 profile (8 Hz): the port flaps UNCALIBRATED/SLAVE (NEEDS.md, "Interop findings" 2) |
+| `ptp4l_test.exs` (a) | ptp4l master (`--serverOnly`), `ExPtp.Port` slave, default and AES67 intervals | LISTENING, UNCALIBRATED, SLAVE; follows ptp4l's clockIdentity; median clock error 36 to 46 us, mean path delay 64 to 71 us. AES67 profile (8 Hz): SLAVE once, no state change afterwards (asserted) |
 | (b) | `ExPtp.Port` master, ptp4l slave (`--clientOnly`) | ptp4l logs `LISTENING to UNCALIBRATED on RS_SLAVE`, `UNCALIBRATED to SLAVE on MASTER_CLOCK_SELECTED`, servo s0, s1, s2; median offset 36 to 38 us, path delay 64 to 67 us |
 | (c1) to (c4) | BMCA: priority1 on either side, priority1 raised on ptp4l at run time with `pmc`, clockIdentity tie break (port identity just below or above ptp4l's) | the expected master on both sides in every case |
 | (d) | tcpdump in ptp4l's namespace during (a) | every frame decodes with `ExPtp.Message` and matches Wireshark's fields |
@@ -263,12 +264,12 @@ What the setup needed and what it cannot do:
 - ptp4l cannot adjust CLOCK_REALTIME in an unprivileged container and then never leaves servo state s0.
   `containers/linuxptp/fakeclock.c` (LD_PRELOAD) makes `clock_adjtime` succeed without touching the clock, so s1 and s2
   appear; ptp4l's offsets are the real offsets. ptp4l's software timestamp servo takes about 11 s to reach s2.
-- A master that announces the PTP timescale must send TAI: the transport takes `tai_offset_s: 37`
-  (otherwise ptp4l reports 37 s offset). The slave side follows ptp4l's `-S` master, which announces an
-  arbitrary timescale.
+- A master that announces the PTP timescale must send TAI: the transport delivers it by default
+  (`tai_offset_s: 37`, otherwise ptp4l reports 37 s offset). The slave side follows ptp4l's `-S` master, which
+  announces an arbitrary timescale, so those tests start the transport with `timescale: :arb`.
 - Software timestamps on a shared host: offsets are tens of microseconds with outliers up to milliseconds,
   so the assertions are loose (medians below 150 to 500 us).
 - No peer delay, L2, one-step, hardware timestamps or other implementations, see NEEDS.md.
-- Findings: `time_source` default 0xA should be 0xA0 (a real bug), servo gains for software timestamps,
-  transport to move to `lib/`, timescale of the transport.
+- Findings, all fixed: `time_source` default 0xA0, servo profile for software timestamps, transport in `lib/`,
+  timescale of the transport.
 

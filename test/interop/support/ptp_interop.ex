@@ -2,7 +2,7 @@ defmodule Interop.Ptp do
   @moduledoc false
   # Orchestration for the linuxptp tests: ptp4l runs in a detached container of the
   # `ex-interop-linuxptp` image, the BEAM side (ExPtp.Port over
-  # PtpInterop.UdpTransport, test/interop/support/ptp_node.exs) in an Elixir
+  # ExPtp.Transport.Udp, test/interop/support/ptp_node.exs) in an Elixir
   # container on the same podman network. Both containers share the host kernel
   # clock, so a correctly synchronised port clock has zero error against CLOCK_REALTIME.
 
@@ -169,7 +169,6 @@ defmodule Interop.Ptp do
         do: {String.to_integer(off), String.to_integer(st), String.to_integer(delay)}
   end
 
-  @doc "Clock identity ptp4l selected as best master (e.g. `eeeeee.fffe.000001`)."
   @doc "Logs of `name` once ptp4l has logged its best master choice (polls up to 10 s)."
   def logs_with_best_master(name, tries \\ 20) do
     log = logs(name)
@@ -182,6 +181,7 @@ defmodule Interop.Ptp do
     end
   end
 
+  @doc "Clock identity ptp4l selected as best master (e.g. `eeeeee.fffe.000001`)."
   def best_master(log) do
     case Regex.scan(
            ~r/selected (?:best master clock|local clock) (\S+?)(?: as best master)?\n/,

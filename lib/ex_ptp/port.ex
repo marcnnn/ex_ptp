@@ -25,10 +25,13 @@ defmodule ExPtp.Port do
   `:port_number` (1), `:profile` (`ExPtp.Profile`, default `:default`),
   `:priority1`, `:priority2`, `:clock_class`, `:clock_accuracy`,
   `:domain_number`, `:slave_only`, `:two_step` (true), `:servo` (`:float` or
-  `:fixed`), `:step_threshold_ns` (offsets above it step the clock, default
-  100_000), `:lock_threshold_ns` (500), `:lock_count` (5), `:mpd_shift`
+  `:fixed`), `:timestamping` (`:hardware` or `:software`, default the transport's;
+  selects the `ExPtp.Servo.Profile` that gives the defaults of the next options),
+  `:servo_gains` (`{kp, ki}` or a function of the log sync interval),
+  `:step_threshold_ns` (offsets above it step the clock, hardware default 100_000),
+  `:lock_threshold_ns` (500), `:lock_count` (5), `:unlock_factor` (2), `:mpd_shift`
   (mean path delay filter 2^-n, default 2), `:time_properties`
-  (`ExPtp.DataSets.TimeProperties`), `:port_ds` (overrides, e.g.
+  (`ExPtp.DataSets.TimeProperties`, default from the transport's timescale), `:port_ds` (overrides, e.g.
   `log_sync_interval: -3`), `:name`.
 
   Subscribers (`subscribe/1`) get `{:ex_ptp, pid, {:state, new, old}}`,
@@ -55,14 +58,14 @@ defmodule ExPtp.Port do
     Message,
     PortState,
     Profile,
-    Servo,
     Timestamp,
     Transport
   }
 
   alias ExPtp.DataSets.{Current, Default, Parent, TimeProperties}
   alias ExPtp.DataSets.Port, as: PortDS
-  alias ExPtp.Servo.{FixedPI, Lock, PI}
+  alias ExPtp.Servo.{FixedPI, Lock, Outlier, PI}
+  alias ExPtp.Servo.Profile, as: ServoProfile
 
   @undefined_interval 0x7F
 
@@ -76,6 +79,8 @@ defmodule ExPtp.Port do
     :foreign,
     :servo,
     :servo_kind,
+    :sprofile,
+    :outlier,
     :lock,
     :opts,
     :last_sync,
@@ -143,15 +148,18 @@ defmodule ExPtp.Port do
         Keyword.get(opts, :port_ds, [])
       )
 
+    sprofile = servo_profile(opts, {mod, handle})
+
     s = %__MODULE__{
       transport: {mod, handle},
       default_ds: default_ds,
       port_ds: port_ds,
       current_ds: %Current{},
       parent_ds: Parent.from_default(default_ds),
-      time_properties: Keyword.get(opts, :time_properties, %TimeProperties{}),
+      time_properties: time_properties(opts, {mod, handle}),
       opts: opts,
-      servo_kind: Keyword.get(opts, :servo, :float)
+      servo_kind: Keyword.get(opts, :servo, :float),
+      sprofile: sprofile
     }
 
     mod.attach(handle, self())
@@ -269,8 +277,22 @@ defmodule ExPtp.Port do
         pending_dreq: nil,
         offset: nil,
         servo: nil,
-        lock: nil
+        lock: nil,
+        outlier: nil
     }
+  end
+
+  # The announced time properties follow the transport's timescale unless given
+  defp time_properties(opts, transport) do
+    Keyword.get_lazy(opts, :time_properties, fn ->
+      case Transport.timescale(transport) do
+        {:ptp, offset, valid} ->
+          %TimeProperties{current_utc_offset: offset, current_utc_offset_valid: valid}
+
+        :arb ->
+          %TimeProperties{ptp_timescale: false, time_source: 0xA0}
+      end
+    end)
   end
 
   defp reset_foreign(s) do
@@ -357,7 +379,7 @@ defmodule ExPtp.Port do
       s
       | parent_ds: Parent.from_default(s.default_ds),
         current_ds: %Current{},
-        time_properties: Keyword.get(s.opts, :time_properties, %TimeProperties{})
+        time_properties: time_properties(s.opts, s.transport)
     }
   end
 
@@ -486,30 +508,67 @@ defmodule ExPtp.Port do
 
     notify(s, {:offset, off_ns, Correction.to_ns(s.mpd)})
 
-    if abs(off_ns) > Keyword.get(s.opts, :step_threshold_ns, 100_000) do
-      {mod, handle} = s.transport
-      mod.step_clock(handle, -round(off_ns))
-      s = %{s | servo: nil, lock: nil, last_sync: nil}
-      fire(s, :synchronization_fault)
-    else
-      s = ensure_servo(s)
-      {ppb, kind} = servo_step(s.servo, offset)
-      {mod, handle} = s.transport
-      mod.adjust_frequency(handle, ppb)
-      notify(s, {:servo, ppb})
-      lock = Lock.update(s.lock, off_ns)
-      s = %{s | servo: kind, freq_ppb: ppb, lock: lock}
+    {verdict, s} = outlier_check(s, off_ns)
 
-      cond do
-        lock.locked and s.port_ds.port_state == :uncalibrated -> fire(s, :master_clock_selected)
-        not lock.locked and s.port_ds.port_state == :slave -> fire(s, :synchronization_fault)
-        true -> s
-      end
+    cond do
+      verdict == :reject ->
+        s
+
+      abs(off_ns) > opt(s, :step_threshold_ns) ->
+        {mod, handle} = s.transport
+        mod.step_clock(handle, -round(off_ns))
+        s = %{s | servo: nil, lock: nil, outlier: nil, last_sync: nil}
+        fire(s, :synchronization_fault)
+
+      true ->
+        s = ensure_servo(s)
+        {ppb, kind} = servo_step(s.servo, offset)
+        {mod, handle} = s.transport
+        mod.adjust_frequency(handle, ppb)
+        notify(s, {:servo, ppb})
+        lock = Lock.update(s.lock, off_ns)
+        s = %{s | servo: kind, freq_ppb: ppb, lock: lock}
+
+        cond do
+          lock.locked and s.port_ds.port_state == :uncalibrated ->
+            fire(s, :master_clock_selected)
+
+          not lock.locked and s.port_ds.port_state == :slave ->
+            fire(s, :synchronization_fault)
+
+          true ->
+            s
+        end
+    end
+  end
+
+  defp outlier_check(%{sprofile: %{outlier: nil}} = s, _), do: {:ok, s}
+
+  defp outlier_check(s, off_ns) do
+    f = s.outlier || Outlier.new(s.sprofile.outlier)
+    {verdict, f} = Outlier.check(f, off_ns)
+    {verdict, %{s | outlier: f}}
+  end
+
+  # Servo profile from `:timestamping` (else the transport's), see `ExPtp.Servo.Profile`
+  defp servo_profile(opts, transport) do
+    kind = Keyword.get_lazy(opts, :timestamping, fn -> Transport.timestamping(transport) end)
+    ServoProfile.get(kind)
+  end
+
+  # a port option, else the servo profile's value
+  defp opt(s, key), do: Keyword.get_lazy(s.opts, key, fn -> Map.fetch!(s.sprofile, key) end)
+
+  defp gains(s) do
+    case Keyword.get(s.opts, :servo_gains) do
+      nil -> ServoProfile.gains(s.sprofile, s.port_ds.log_sync_interval)
+      f when is_function(f, 1) -> f.(s.port_ds.log_sync_interval)
+      {_kp, _ki} = g -> g
     end
   end
 
   defp ensure_servo(%{servo: nil} = s) do
-    {kp, ki} = Servo.gains(s.port_ds.log_sync_interval)
+    {kp, ki} = gains(s)
 
     servo =
       case s.servo_kind do
@@ -519,10 +578,7 @@ defmodule ExPtp.Port do
 
     lock =
       s.lock ||
-        Lock.new(
-          Keyword.get(s.opts, :lock_threshold_ns, 500),
-          Keyword.get(s.opts, :lock_count, 5)
-        )
+        Lock.new(opt(s, :lock_threshold_ns), opt(s, :lock_count), opt(s, :unlock_factor))
 
     %{s | servo: servo, lock: lock}
   end
@@ -604,7 +660,7 @@ defmodule ExPtp.Port do
   defp filter_mpd(%{mpd: nil}, sample), do: sample
 
   defp filter_mpd(s, sample),
-    do: s.mpd + Bitwise.bsr(sample - s.mpd, Keyword.get(s.opts, :mpd_shift, 2))
+    do: s.mpd + Bitwise.bsr(sample - s.mpd, opt(s, :mpd_shift))
 
   # -- transmit -------------------------------------------------------------------------------
 

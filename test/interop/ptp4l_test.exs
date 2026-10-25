@@ -41,17 +41,14 @@ defmodule ExPtp.Interop.Ptp4lTest do
         p4 = Ptp.unique("p4l")
         Ptp.start_ptp4l(p4, ["--serverOnly=1", "--priority1=100"] ++ @profiles[profile])
 
-        # ExPtp.Servo uses linuxptp's hardware timestamp gains. With software timestamps
-        # at 8 Hz (AES67 profile) the port flaps between UNCALIBRATED and SLAVE unless the
-        # lock threshold is wide (NEEDS.md, "Interop findings", 1)
-        lock_ns = if profile == :aes67, do: 500_000, else: 100_000
-
+        # ptp4l -S announces an arbitrary timescale and sends CLOCK_REALTIME, so the
+        # port's software clock (software servo profile of the UDP transport) is UTC here
         events =
           Ptp.run_beam(
             profile: profile,
             seconds: 40,
             priority1: 128,
-            lock_ns: lock_ns,
+            timescale: :arb,
             id: 1
           )
 
@@ -60,7 +57,16 @@ defmodule ExPtp.Interop.Ptp4lTest do
         assert {:listening, :uncalibrated} in states
         assert {:uncalibrated, :slave} in states
         assert {:final, final} = List.keyfind(events, :final, 0)
-        assert final.state in [:slave, :uncalibrated]
+        assert final.state == :slave
+
+        # once SLAVE, the software servo profile keeps the lock: no state change afterwards
+        after_slave =
+          events
+          |> Enum.drop_while(&(not match?({:state, :slave, :uncalibrated, _}, &1)))
+          |> Enum.drop(1)
+
+        assert for({:state, new, old, _} <- after_slave, do: {old, new}) == [],
+               "lock lost after reaching SLAVE: #{inspect(after_slave)}"
 
         # the port follows the master ptp4l announced (clock identity from its MAC)
         ptp4l_id = Ptp.best_master(log) |> String.replace(".", "") |> String.upcase()
@@ -75,6 +81,16 @@ defmodule ExPtp.Interop.Ptp4lTest do
         assert Enum.max(recent) < 2_000_000, "max clock error #{inspect(recent)} ns"
 
         mpds = for {:offset, _, mpd, _} <- events, do: mpd
+
+        settled =
+          for {:offset, _, _, e} <-
+                Enum.drop_while(events, &(not match?({:state, :slave, _, _}, &1))),
+              do: abs(e)
+
+        IO.puts(
+          "(a) #{profile}: after SLAVE #{length(settled)} samples, median |clock error| " <>
+            "#{Ptp.median(settled)} ns, max #{Enum.max(settled)} ns"
+        )
 
         IO.puts(
           "(a) #{profile}: median |clock error| #{Ptp.median(errs)} ns, " <>
@@ -107,7 +123,7 @@ defmodule ExPtp.Interop.Ptp4lTest do
             id: 1
           )
 
-        log = Ptp.logs(p4)
+        log = Ptp.logs_with_best_master(p4)
         transitions = Ptp.ptp4l_transitions(log)
         assert {"LISTENING", "UNCALIBRATED", "RS_SLAVE"} in transitions, log
         assert {"UNCALIBRATED", "SLAVE", "MASTER_CLOCK_SELECTED"} in transitions, log
@@ -140,9 +156,9 @@ defmodule ExPtp.Interop.Ptp4lTest do
       Ptp.start_ptp4l(p4, ["--priority1=100"])
 
       events =
-        Ptp.run_beam(profile: :default, seconds: 35, priority1: 110, lock_ns: 100_000, id: 1)
+        Ptp.run_beam(profile: :default, seconds: 35, priority1: 110, timescale: :arb, id: 1)
 
-      log = Ptp.logs(p4)
+      log = Ptp.logs_with_best_master(p4)
       assert {:final, %{state: :slave}} = List.keyfind(events, :final, 0)
       assert log =~ "assuming the grand master role"
       refute log =~ "to SLAVE"
@@ -152,7 +168,7 @@ defmodule ExPtp.Interop.Ptp4lTest do
       p4 = Ptp.unique("p4l")
       Ptp.start_ptp4l(p4, ["--priority1=100"])
       events = Ptp.run_beam(profile: :default, seconds: 35, priority1: 90, tai: @tai, id: 1)
-      log = Ptp.logs(p4)
+      log = Ptp.logs_with_best_master(p4)
       assert {:final, %{state: :master}} = List.keyfind(events, :final, 0)
       assert {"UNCALIBRATED", "SLAVE", "MASTER_CLOCK_SELECTED"} in Ptp.ptp4l_transitions(log)
       assert Ptp.best_master(log) == @port_cid
@@ -169,7 +185,6 @@ defmodule ExPtp.Interop.Ptp4lTest do
             seconds: 70,
             priority1: 110,
             tai: @tai,
-            lock_ns: 100_000,
             id: 1
           )
         end)
@@ -181,7 +196,7 @@ defmodule ExPtp.Interop.Ptp4lTest do
       Ptp.pmc(p4, "SET PRIORITY1 120")
       assert Ptp.pmc(p4, "GET PRIORITY1") =~ "priority1 120"
       events = Task.await(task, 120_000)
-      log = Ptp.logs(p4)
+      log = Ptp.logs_with_best_master(p4)
 
       states = for {:state, new, old, _} <- events, do: {old, new}
 
@@ -220,11 +235,10 @@ defmodule ExPtp.Interop.Ptp4lTest do
             profile: :default,
             seconds: 30,
             cid: port_cid,
-            tai: @tai,
-            lock_ns: 100_000
+            tai: @tai
           )
 
-        log = Ptp.logs(p4)
+        log = Ptp.logs_with_best_master(p4)
         assert {:final, final} = List.keyfind(events, :final, 0)
 
         if port_master do
@@ -246,7 +260,7 @@ defmodule ExPtp.Interop.Ptp4lTest do
       dir = Interop.Tshark.tmp_dir()
       File.chmod!(dir, 0o777)
       stop = Ptp.capture(p4, dir, "udp port 319 or udp port 320")
-      events = Ptp.run_beam(profile: :default, seconds: 30, lock_ns: 100_000, id: 1)
+      events = Ptp.run_beam(profile: :default, seconds: 30, timescale: :arb, id: 1)
       frames = stop.()
       assert {:final, %{state: state}} = List.keyfind(events, :final, 0)
       assert state in [:slave, :uncalibrated]
