@@ -273,3 +273,7 @@ What the setup needed and what it cannot do:
 - Findings, all fixed: `time_source` default 0xA0, servo profile for software timestamps, transport in `lib/`,
   timescale of the transport.
 
+
+## License
+
+Apache-2.0, see `LICENSE`.
