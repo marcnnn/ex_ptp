@@ -203,6 +203,32 @@ defmodule ExPtp.RTL.WallclockTest do
     assert_raise FunctionClauseError, fn -> RW.slew_args(1 <<< 29, 4) end
   end
 
+  test "H to S: the increment stays after the servo's last inc_wr; only inc_wr changes it" do
+    mod = RW.build(inc_out: true)
+    inc = Wallclock.increment(@nominal, -70_000)
+
+    cmds =
+      [%{set_wr: 1, set_sec: 60, set_ns: 0, inc_wr: 1, inc_in: inc}] ++
+        List.duplicate(%{}, 20) ++
+        [
+          %{step_wr: 1, step_ns: -5000},
+          %{set_wr: 1, set_sec: 90, set_ns: 5},
+          %{snap_wr: 1},
+          %{cap: 3}
+        ] ++
+        List.duplicate(%{}, 10) ++
+        [Map.merge(%{slew_wr: 1}, RW.slew_args(300, 40))] ++ List.duplicate(%{}, 60)
+
+    out = T.beam(mod, T.stimulus(mod, cmds, 2))
+    assert Enum.all?(Enum.drop(out, 4), &(&1.inc_out == inc))
+
+    # software steering continues from it: a new increment through the same strobe
+    inc2 = Wallclock.increment(@nominal, -69_000)
+    tail = [%{inc_wr: 1, inc_in: inc2}, %{}, %{}]
+    out2 = T.beam(mod, T.stimulus(mod, cmds ++ tail, 2))
+    assert List.last(out2).inc_out == inc2
+  end
+
   @tag :verilator
   @tag timeout: 300_000
   property "Verilator equals the BEAM simulator" do
