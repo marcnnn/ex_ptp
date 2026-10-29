@@ -65,6 +65,24 @@ defmodule ExPtp.Servo do
   end
 
   @doc """
+  `pi_step/5` with an integrator preload, the kernel behind `ExPtp.RTL.Servo`:
+  the sample is `{err, pre, ld}` (`err` of `err_format/0`, `pre` of
+  `fixed_format/0`, `ld` u8). With `ld` = 0 it is `pi_step/5` bit for bit; with
+  `ld` = 1 the integrator is replaced by `pre` before the step, so a sample
+  `{0, pre, 1}` outputs `pre` and leaves `pre` as the state: the loop continues
+  at a rate known from elsewhere (bumpless handover from a software servo).
+  """
+  defn pi_step_pre({err, pre, ld}, integ, kp, ki, opts \\ []) do
+    pi_step(err, mux(ld, pre, integ), kp, ki, opts)
+  end
+
+  deftransform(mux(ld, %NxFixed.Fixed{} = a, %NxFixed.Fixed{} = b),
+    do: %NxFixed.Fixed{t: Nx.select(Nx.not_equal(ld, 0), a.t, b.t), frac: b.frac}
+  )
+
+  deftransform(mux(ld, a, b), do: Nx.select(Nx.not_equal(ld, 0), a, b))
+
+  @doc """
   Lock detector kernel: `err` (s32, raw error of `err_format/0`), state
   `run` (u8, consecutive in-threshold samples, saturating at 255), params
   `thr` (s32, raw threshold) and `needed` (u8). Outputs 1 once `needed`

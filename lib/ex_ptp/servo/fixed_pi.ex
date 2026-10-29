@@ -33,6 +33,9 @@ defmodule ExPtp.Servo.FixedPI do
   defp gain(g),
     do: g |> Kernel.*(1 <<< @gain_frac) |> round() |> max(-(1 <<< 23)) |> min((1 <<< 23) - 1)
 
+  @doc "The state with the integrator replaced by the raw output `integ` (the rate to continue from)."
+  def preload(%__MODULE__{} = s, integ), do: %{s | integ: clip(integ)}
+
   @doc "Raw error input from ns (a number), saturated to s32."
   def err(ns), do: (ns * 256) |> round() |> max(-(1 <<< 31)) |> min((1 <<< 31) - 1)
 
