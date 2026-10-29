@@ -18,6 +18,8 @@ a closed loop with two clocks (see "Hardware").
 | Port state machine, profiles (default, AES67, SMPTE ST 2059-2) | `ExPtp.PortState`, `ExPtp.Profile` | done |
 | Ordinary clock process over a pluggable transport (E2E delay mechanism) | `ExPtp.Port`, `ExPtp.Transport` | done |
 | Simulated network: delay, asymmetry, jitter, loss, drift | `ExPtp.Sim`, `ExPtp.Sim.Node` | done |
+| Adjustable clock behaviour (`now`, `freq`, `adj_freq`, `step`, `set`, `caps`), wallclock model and read-only system clock implementations | `ExPtp.Clock`, `.Clock.Wallclock`, `.Clock.System` | done |
+| Software servo (mode S) and monitor mode over any `ExPtp.Clock`: PI, lock, step, statistics, bumpless start from the clock's rate | `ExPtp.SoftServo` | done, tested against simulated clocks (the card's clock lives in aes67_card) |
 | Offset and mean path delay, E2E and P2P | `ExPtp.Delay` | done (model) |
 | Wallclock | `ExPtp.Wallclock`, `ExPtp.RTL.Wallclock` | done (model, RTL bit-exact) |
 | PI servo, lock detection | `ExPtp.Servo` (`pi_step`, `lock_step` scan kernels), `ExPtp.Servo.FixedPI`, `.PI`, `.Lock`, `ExPtp.RTL.Servo`, `ExPtp.RTL.Offset` | done (model, RTL) |
@@ -63,8 +65,24 @@ Reference models, all integer and deterministic unless noted:
 | `ExPtp.Delay` | `e2e_mean_path_delay/6`, `p2p_mean_path_delay/6`, `offset_from_master/4`, `rate_ratio/4`; scaled ns (2^-16) |
 | `ExPtp.Servo.pi_step/5` | `step(err, integ, kp, ki, format: f) -> {ppb, integ}`, float (`Num.float()`) or fixed (`Servo.fixed_format()`); `Servo.run/4` on the CPU reference, `ExHdl.DSP.analyze_scan/3` with `ii: 2` for hardware |
 | `ExPtp.Servo.FixedPI` | the same recurrence on raw integers, bit-identical to the kernel |
+| `ExPtp.Servo.pi_step_pre/5` | `step({err, pre, ld}, integ, kp, ki, format: f)`: `pi_step/5` with the integrator replaced by `pre` when `ld` is 1 (the RTL servo's kernel) |
 | `ExPtp.Servo.lock_step/4` | `step(err, run, thr, needed) -> {locked, run}` |
 | `ExPtp.MediaClock` | `rtp_timestamp(ptp_time, rate, offset)`, `sample_time/4`; `Nco.step(phase, inc) -> {tick, phase}` |
+
+Both PTP modes are first class. In mode H the hardware servo (`ExPtp.RTL.Servo`) steers the
+wallclock and the host only runs the protocol. In mode S the host runs `ExPtp.SoftServo` and writes the
+result through an `ExPtp.Clock` (`adj_freq` is an absolute rate, `step`, `set`); `mode: :monitor` takes
+the same samples and never touches the clock (ptp4l `free_running 1`). Switching is bumpless: H to S
+needs nothing in hardware (the wallclock keeps its increment, `SoftServo.new/2` starts its integrator at
+`Clock.freq/1`); S to H writes `pre_wr` / `pre` of the RTL servo (`RTL.Servo.preload_for/2`
+from the increment) while the servo's `inc_wr` is still gated off, then enables it.
+
+```elixir
+clock = ExPtp.Clock.Wallclock.start(hz: 125_000_000, drift_ppb: 50_000)   # or any {module, handle}
+s = ExPtp.SoftServo.new(clock, profile: :hardware, log_interval: -3)      # mode: :monitor to only record
+{event, s} = ExPtp.SoftServo.exchange(s, t1, t2, t3, t4)                  # :servo | :step | :reject | :monitor
+ExPtp.SoftServo.status(s)    # %{mode, locked, ppb, offset_ns, mpd_ns, samples, steps, rejected}
+```
 
 Custom transports implement `ExPtp.Transport` (send with hardware egress
 timestamp, local clock read, timers, frequency adjust, phase step).
@@ -86,7 +104,7 @@ lanes (byte 0 in `tdata[7:0]`).
 | `RTL.RxStamp` | RX frames with timestamp and classification in `tuser` (102 bits, `RTL.Meta`) | `s_axis` (`ExNet.RTL.Ifc.mac_rx` with `tready`, bit 0 of the 4 bit user = bad), `m_axis` (user 102), `ts_valid`, `ts` |
 | `RTL.TxInsert` | one-step Sync: origin timestamp written in the stream, UDP checksum zeroed | `s_axis`, `m_axis` (`ExNet.RTL.Ifc.mac_tx`, tag in `tuser` passed through), `enable`, `zero_csum`, `comp`, `now_*`, `stamped` |
 | `RTL.Offset` | `Delay` offset and mean path delay from t1..t4 | `go`, `t1..t4` (94 bit), `valid`, `err`, `mpd` |
-| `RTL.Servo` | `pi_step` kernel (wrapped), lock detector, ppb to increment | `err_valid`, `err`, `load`, `kp`, `ki`, `nominal`, `scale`, `thr*`, `needed`; `inc_wr`, `inc`, `ppb`, `locked` |
+| `RTL.Servo` | `pi_step_pre` kernel (wrapped), lock detector, ppb to increment, integrator preload | `err_valid`, `err`, `pre_wr`, `pre`, `load`, `kp`, `ki`, `nominal`, `scale`, `thr*`, `needed`; `inc_wr`, `inc`, `ppb`, `locked` |
 | `RTL.Ifc` | the media clock contract (`tick`, `rtp_ts`), pointers to `Meta` and the MAC strobes | `media_clock(:master \| :slave)` |
 | `RTL.MediaNco` | sample tick, RTP timestamp, MCLK enable, alignment to PTP time | `now_*`, `rate`, `offset`, `inc_wr`/`inc_in` or `follow` + `wc_inc` + `kscale`, `align`; `tick`, `rtp_ts`, `mclk_en`, `aligned` (`RTL.Ifc.media_clock/2`) |
 
@@ -125,7 +143,7 @@ old value); the FCS is appended by the MAC after this module, so it is correct
 by construction. The stream and the wallclock must share a clock (wallclock on
 the MAC TX clock).
 
-**Servo.** The PI step is the Nx kernel `ExPtp.Servo.pi_step/5` generated by
+**Servo.** The PI step is the Nx kernel `ExPtp.Servo.pi_step_pre/5` (`pi_step/5` plus an integrator preload) generated by
 `ExHdl.DSP.scan_to_sv/3` (`ii: 2`, latency 11) and wrapped with
 `ExHdl.RTL.Wrap.scan/1`, so CPU reference, `FixedPI` and hardware share one
 definition. A hand written RTL PI would duplicate the arithmetic; the price is
@@ -133,6 +151,11 @@ that wrapped kernels have no BEAM model, so the servo is checked in Verilator
 against `FixedPI`, `Lock` and `Servo.inc_for/2` directly. `inc_wr`/`inc` plug
 into the wallclock's `inc_wr`/`inc_in` (`inc = nominal + ppb * scale`, within
 one unit of `Wallclock.increment/2`).
+`pre_wr` with `pre` (raw ppb, `Servo.preload_for(inc, nominal)` for an increment) sends a sample
+`{err 0, pre, ld 1}` through the kernel, which replaces the integrator by `pre`: the output equals
+the current rate and the next sample continues from it, so enabling the hardware servo after
+software steering (S to H) does not jump the rate. H to S needs nothing in hardware (the increment
+register keeps its value; test in `test/rtl/wallclock_test.exs`).
 
 **Media clock.** `MediaNco` is `MediaClock.Nco` (a 64-bit phase accumulator;
 tick on carry, RTP counter, `mclk_en` when the top 8 phase bits change: 256 per
@@ -153,6 +176,7 @@ wallclock step.
 | Timestamp unit, two unrelated clocks | RX stamps equal compensated wallclock at the capture edge; latency 16 to 23 ns at 8 ns; TX tags in order, no loss |
 | PtpDetect, RxStamp, TxInsert, 8/32/64-bit buses, random `tvalid`/`tready` | all frames classified like `PtpDetect.classify/1` (itself checked against the generator's truth), bytes unchanged except the written fields |
 | Servo vs `FixedPI`/`Lock`/`inc_for` | identical PI output, increment and lock state per sample (Verilator) |
+| Servo preload vs `FixedPI.preload/2` (random samples and preloads), preload from an increment | identical PI output and increment per sample; the preload's output is exactly the increment it was made from (Verilator) |
 | `Offset` vs `Delay` and `FixedPI.err_from_scaled` | identical |
 | `MediaNco` | equal to `Nco.step` per cycle; aligned within 1e-12 sample of exact |
 | MAC TX (`ExNet.RTL.MacTx`) with `TimestampUnit`, two unrelated clocks | tag of every frame in order, stamp = wallclock at the Start word edge within -3.8..+2.6 ns |
@@ -182,6 +206,22 @@ ns over the whole run. The `Port` run is slower because it sends Delay_Req
 once a second with a filtered path delay and restarts its servo after the step
 (not analysed further).
 
+**Software servo loop** (`test/ex_ptp/soft_servo_test.exs`, BEAM only, a second): `ExPtp.SoftServo` steering a
+simulated slave (`ExPtp.Clock.Wallclock`, 125 MHz, +50 ppm crystal error) against a master (-20 ppm) with 5 us delay,
+200 ns jitter, 3 ms initial offset, one exchange per 125 ms, hardware gains and thresholds:
+
+| | `SoftServo` | RTL loop above (240 ns tick) |
+|---|---|---|
+| peak offset after the step | 38.1 us | 33.8 us |
+| intervals until the offset stays within 3 us | 25 | 27 |
+| locked after | 56 intervals | 60 intervals |
+| largest offset in the last 10 intervals | 140 ns | 169 ns |
+| servo frequency | -70198 ppb | -70125 ppb |
+
+Handover tests run the hardware servo model (`FixedPI` writing the increment) and `SoftServo` on the same
+clock in both directions: no step in phase, the first rate change is at most `(kp + ki) * offset`; without the
+preload (`ppb: 0.0`) it is the whole 70 ppm.
+
 ### Resources
 
 Yosys `synth_xilinx -family xcup` (UltraScale+), numbers of the block alone
@@ -197,7 +237,7 @@ Yosys `synth_xilinx -family xcup` (UltraScale+), numbers of the block alone
 | RxStamp 64 bit | 159 | 362 | 0 | 7 |
 | TxInsert 64 bit | 525 | 418 | 0 | 0 |
 | TxInsert 8 bit | 318 | 352 | 0 | 0 |
-| Servo (PI kernel, lock, rate) | 816 | 545 | 14 | 3 |
+| Servo (PI kernel with preload, lock, rate) | 782 | 975 | 10 | 3 |
 | Offset | 347 | 182 | 2 | 0 |
 | MediaNco | 1074 | 749 | 24 | 0 |
 

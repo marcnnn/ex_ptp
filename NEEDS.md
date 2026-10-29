@@ -207,6 +207,23 @@ profile's announce timeout and domain constraints on a switch, other implementat
 grandmaster, Dante, AVB `gptp`).
 
 
+## Clock modes (branch `nic/clock-modes`)
+
+- ex_hdl: none new. A wrapped kernel with a tuple sample (`{err, pre, ld}`) and a `u8` flag worked as is;
+  there is still no way to read or load a wrapped kernel's state from outside, which is why the preload is an
+  extra sample field (`ExPtp.Servo.pi_step_pre/5`) and not a state port. A `state_load` option on
+  `Wrap.scan` would make a preload without a sample slot possible.
+- aes67_card (adopts the API afterwards): an `ExPtp.Clock` over the wallclock registers (`now` from the
+  snapshot, `freq` from the increment readback `inc_out` or the last written increment, `adj_freq` as
+  `Wallclock.increment/2` into `inc_wr`, `step` as `step_wr` or `slew_wr` beyond 2^29 ns, `set`), the `pre_wr` /
+  `pre` registers of `RTL.Servo`, and the sequence S to H: preload, wait `ppb_valid`, enable.
+- `ExPtp.Port` still has its own copy of the servo glue (outlier filter, step, lock, mean path delay
+  filter); it could run on `ExPtp.SoftServo` and an `ExPtp.Clock` over the transport. Not done, to keep the
+  protocol code and the ptp4l interop results untouched.
+- `ExPtp.Clock.System` is read only (no `clock_adjtime` without a NIF and CAP_SYS_TIME); a steerable clock
+  without privileges is the software clock inside `ExPtp.Transport.Udp`, not yet an `ExPtp.Clock`.
+- `SoftServo` keeps the integrator across a phase step (linuxptp does too); `Port` restarts its servo.
+
 ## Wave 3 leftovers (ex_ptp internal)
 
 - `test/ex_ptp/sim_test.exs` "SMPTE ST 2059-2 profile ..." passes in the full run but fails when run

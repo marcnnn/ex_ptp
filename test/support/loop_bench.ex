@@ -91,6 +91,8 @@ defmodule ExPtp.Test.LoopBench do
       sv.err_valid <~ (off.valid and not big)
       sv.err <~ err
       sv.load <~ load
+      sv.pre_wr <~ 0
+      sv.pre <~ const(0, s(28))
       sv.kp <~ kp
       sv.ki <~ ki
       sv.nominal <~ const(nominal, u(40))
